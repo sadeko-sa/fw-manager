@@ -926,7 +926,7 @@ class App(tk.Tk):
         return code == 0
 
     def _run_updates(self, devs):
-        """Update devices one after another, re-checking each afterwards."""
+        """Update devices one after another (re-check only when an upload failed)."""
         for d in devs:
             self.busy.add(d["name"])
         self.ui(self._refresh_devices)
@@ -935,10 +935,9 @@ class App(tk.Tk):
             for d in devs:
                 ok = self._install(d)
                 self.say("%s: update %s" % (d["name"], "finished" if ok else "FAILED"))
-                # Devices usually reboot after flashing; give them a moment.
-                if ok:
-                    threading.Event().wait(4)
-                self._do_check(d)
+                # No re-check after a successful upload; only after a failure.
+                if not ok:
+                    self._do_check(d)
                 self.busy.discard(d["name"])
                 self.ui(self._refresh_devices)
         threading.Thread(target=job, daemon=True).start()
