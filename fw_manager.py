@@ -6,7 +6,8 @@ What it does
 ------------
 * Keeps a list of saved devices (name + host + version endpoint).
 * Scans all devices over HTTP, reads the reported firmware info
-  (expected JSON: {"id":"LED_WS2811.ino","build":20261029041512}).
+  (expected JSON: {"id":"LED_WS2811.ino","build":20261029041512,
+  "md5":"<32 hex>"} - md5 is optional, on ESP8266/ESP32 use ESP.getSketchMD5()).
 * Shows firmware id, build, and an update status per device:
     UP TO DATE | UPDATE AVAILABLE | NEWER ON DEVICE | NO BINARY LINKED | UNKNOWN FW
 * Keeps a firmware registry: firmware id -> binary file + install command
@@ -25,6 +26,14 @@ Examples:
   python espota.py -i {host} -f "{file}"
   arduino-cli upload -i "{file}" -p {host} --fqbn esp8266:esp8266:nodemcuv2
 
+MD5 check (when the device reports "md5"):
+  md5 equal to the md5 of the linked binary  -> UP TO DATE (build ignored)
+  md5 different                              -> UPDATE AVAILABLE (or NEWER ON
+                                                DEVICE if the device build is higher)
+  no md5 reported                            -> build numbers decide, as before
+
+Columns: right click a column header to show/hide columns (saved in the config).
+
 Build number of a binary (first match wins):
   1. manual "build" field in the registry entry
   2. sidecar file "<binary>.json" containing {"build": ...}
@@ -34,6 +43,7 @@ Build number of a binary (first match wins):
 Requirements: Python 3.8+, tkinter (bundled with the standard installers).
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -134,7 +144,7 @@ def fetch_version(dev):
     """
     Ask a device for its firmware info over HTTP.
 
-    Returns (fw_id, build, error_text). On any failure fw_id/build are None
+    Returns (fw_id, build, md5, error_text). On any failure fw_id/build/md5 are None
     and error_text explains why (shown in the Detail column).
     """
     port = dev.get("port") or 80
@@ -146,22 +156,25 @@ def fetch_version(dev):
         with request.urlopen(url, timeout=HTTP_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", "replace").strip()
     except (error.URLError, OSError, ValueError) as exc:
-        return None, None, "no answer (%s)" % getattr(exc, "reason", exc)
+        return None, None, None, "no answer (%s)" % getattr(exc, "reason", exc)
 
     # Preferred format: JSON object with "id" and "build".
     try:
         obj = json.loads(body)
         if isinstance(obj, dict) and obj.get("id"):
-            return str(obj["id"]), str(obj.get("build", "")), ""
+            md5 = str(obj.get("md5") or "").strip().lower()
+            return str(obj["id"]), str(obj.get("build", "")), md5, ""
     except ValueError:
         pass
 
     # Fallback: loose regex for plain-text replies like  id=X build=123
     m_id = re.search(r'"?id"?\s*[:=]\s*"?([\w.\-]+)', body)
     m_bd = re.search(r'"?build"?\s*[:=]\s*"?(\d+)', body)
+    m_md = re.search(r'"?md5"?\s*[:=]\s*"?([0-9a-fA-F]{32})', body)
     if m_id:
-        return m_id.group(1), (m_bd.group(1) if m_bd else ""), ""
-    return None, None, "unrecognized reply"
+        return (m_id.group(1), (m_bd.group(1) if m_bd else ""),
+                (m_md.group(1).lower() if m_md else ""), "")
+    return None, None, None, "unrecognized reply"
 
 
 # --------------------------------------------------------------------------- #
@@ -192,19 +205,60 @@ def local_build(fw):
     return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y%m%d%H%M%S")
 
 
-def compute_status(reported_id, reported_build, target_fw):
+# md5 cache: (path, mtime_ns, size) -> hex digest, so rescans don't rehash.
+_MD5_CACHE = {}
+
+
+def file_md5(path):
+    """Return the lowercase md5 hex digest of a file ('' if unreadable)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    key = (path, st.st_mtime_ns, st.st_size)
+    hit = _MD5_CACHE.get(key)
+    if hit:
+        return hit
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    _MD5_CACHE[key] = h.hexdigest()
+    return _MD5_CACHE[key]
+
+
+def compute_status(reported_id, reported_build, target_fw, reported_md5=""):
     """
     Decide the status string for one device.
 
     reported_id    firmware id the device reported (None if unreachable)
     reported_build build the device reported
     target_fw      registry entry to compare against (or None)
+    reported_md5   md5 the device reported (optional, '' if none)
     """
     if not reported_id:
         return ST_UNKNOWN
     if not target_fw or not target_fw.get("file") or not os.path.isfile(target_fw["file"]):
         return ST_NOBIN
     new = local_build(target_fw)
+
+    # md5 is the exact-identity check; build only gives the ordering.
+    dev_md5 = (reported_md5 or "").strip().lower()
+    if dev_md5:
+        file_md = file_md5(target_fw["file"])
+        if file_md:
+            if dev_md5 == file_md:
+                return ST_OK
+            try:
+                if int(reported_build) > int(new):
+                    return ST_NEWER
+            except (ValueError, TypeError):
+                pass
+            return ST_UPD
+
     if not new or not reported_build:
         # Cannot compare numerically; treat different/missing as update.
         return ST_UPD
@@ -280,8 +334,8 @@ class FormDialog(tk.Toplevel):
 class App(tk.Tk):
     """Main window: devices tab, firmware tab, log pane."""
 
-    DEV_COLS = ("name", "host", "fw_id", "build", "target", "status", "detail")
-    FW_COLS = ("id", "file", "build", "cmd")
+    DEV_COLS = ("name", "host", "fw_id", "build", "md5", "target", "status", "detail")
+    FW_COLS = ("id", "file", "build", "md5", "cmd")
 
     def __init__(self):
         super().__init__()
@@ -335,8 +389,9 @@ class App(tk.Tk):
 
         self.dev_tree = self._make_tree(
             dev_tab, self.DEV_COLS,
-            ("Name", "Host", "Reported FW", "Build", "Target FW", "Status", "Detail"),
-            (140, 140, 170, 140, 170, 140, 260))
+            ("Name", "Host", "Reported FW", "Build", "Reported MD5", "Target FW",
+             "Status", "Detail"),
+            (140, 130, 160, 130, 250, 160, 140, 260), "dev", self._dev_menu)
         # Remove EVERY state mapping that touches "selected" (and the Tk 8.6.9
         # "!selected" bug entries) from the Treeview colors. Result: row tag
         # colors always win, so the native blue selection never hides the
@@ -377,9 +432,9 @@ class App(tk.Tk):
                                         foreground="#000000", font=self.sel_font)
         # Re-mark rows whenever the selection changes.
         self.dev_tree.bind("<<TreeviewSelect>>", lambda e: self._update_marks())
-        # Double click = check, right click = menu.
+        # Double click = check (right click is bound inside _make_tree:
+        # header -> column chooser, row -> device menu).
         self.dev_tree.bind("<Double-1>", lambda e: self.check_selected())
-        self.dev_tree.bind("<Button-3>", self._dev_menu)
 
         # ---- Firmware tab ----
         fw_tab = ttk.Frame(nb)
@@ -393,8 +448,9 @@ class App(tk.Tk):
 
         self.fw_tree = self._make_tree(
             fw_tab, self.FW_COLS,
-            ("Firmware ID", "Binary file", "Build (manual/auto)", "Install command"),
-            (200, 360, 150, 380))
+            ("Firmware ID", "Binary file", "Build (manual/auto)", "File MD5",
+             "Install command"),
+            (180, 320, 140, 250, 340), "fw")
         self.fw_tree.bind("<Double-1>", lambda e: self.edit_fw())
 
         # ---- Log pane ----
@@ -415,8 +471,13 @@ class App(tk.Tk):
         self.menu.add_command(label="Edit", command=self.edit_device)
         self.menu.add_command(label="Remove", command=self.remove_device)
 
-    def _make_tree(self, parent, cols, heads, widths):
-        """Build a Treeview with scrollbar inside parent and return it."""
+    def _make_tree(self, parent, cols, heads, widths, key, row_menu=None):
+        """
+        Build a Treeview with scrollbar inside parent and return it.
+        key       name used to store the visible columns in the config
+        row_menu  optional handler for right click on a row
+        Right click on a column header opens a show/hide column menu.
+        """
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=cols, show="headings",
@@ -429,7 +490,60 @@ class App(tk.Tk):
         tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         tree.pack(fill="both", expand=True)
+
+        # Restore saved column visibility (ignore stale/unknown names).
+        saved = [c for c in self.cfg.get("columns", {}).get(key, []) if c in cols]
+        if saved:
+            tree.configure(displaycolumns=[c for c in cols if c in saved])
+
+        def on_right_click(event):
+            if self._header_menu(tree, key, event):
+                return
+            if row_menu:
+                row_menu(event)
+        tree.bind("<Button-3>", on_right_click)
         return tree
+
+    def _header_menu(self, tree, key, event):
+        """
+        Show the Windows-like 'choose columns' menu when the click landed on
+        the header. Returns True if the click was on the header.
+        """
+        if tree.identify_region(event.x, event.y) not in ("heading", "separator"):
+            return False
+        all_cols = list(tree["columns"])
+        shown = list(tree["displaycolumns"])
+        if shown == ["#all"]:
+            shown = all_cols
+        menu = tk.Menu(self, tearoff=0)
+        menu._vars = []  # keep BooleanVars alive while the menu exists
+        for c in all_cols:
+            var = tk.BooleanVar(value=c in shown)
+            menu._vars.append(var)
+            menu.add_checkbutton(label=tree.heading(c, "text"), variable=var,
+                                 command=lambda c=c: self._toggle_column(tree, key, c))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return True
+
+    def _toggle_column(self, tree, key, col):
+        """Show/hide one column (at least one stays visible) and persist."""
+        all_cols = list(tree["columns"])
+        shown = list(tree["displaycolumns"])
+        if shown == ["#all"]:
+            shown = all_cols
+        if col in shown:
+            if len(shown) == 1:
+                return  # never hide the last column
+            shown.remove(col)
+        else:
+            shown.append(col)
+        shown = [c for c in all_cols if c in shown]  # keep natural order
+        tree.configure(displaycolumns=shown)
+        self.cfg.setdefault("columns", {})[key] = shown
+        save_config(self.cfg)
 
     def _dev_menu(self, event):
         """Right click: select the row under cursor and show the menu."""
@@ -487,6 +601,7 @@ class App(tk.Tk):
                 "", "end", iid=dev["name"],
                 values=(dev["name"], dev["host"],
                         st.get("fw_id") or "unknown", st.get("build", ""),
+                        st.get("md5", ""),
                         tid, status, st.get("detail", "")),
                 tags=(status,))
         # Restore selection where possible.
@@ -499,7 +614,7 @@ class App(tk.Tk):
         """
         Show selection without touching the status color: selected rows keep
         their status background but get a bold underlined font (via the
-        "<status>|sel" tag) and a "> " marker in front of the name.
+        "<status>|sel" tag).
         """
         selected = set(self.dev_tree.selection())
         for iid in self.dev_tree.get_children():
@@ -507,8 +622,6 @@ class App(tk.Tk):
             is_sel = iid in selected
             tags = (status, status + "|sel") if is_sel else (status,)
             self.dev_tree.item(iid, tags=tags)
-            # iid is the device name; prefix the marker only for display.
-            self.dev_tree.set(iid, "name", ("\u25ba " if is_sel else "") + iid)
 
     def _refresh_firmware(self):
         """Rebuild the firmware registry tree."""
@@ -517,6 +630,7 @@ class App(tk.Tk):
             self.fw_tree.insert("", "end", iid=fid, values=(
                 fid, fw.get("file", ""),
                 fw.get("build") or local_build(fw) or "-",
+                file_md5(fw.get("file", "")) or "-",
                 fw.get("cmd", "")))
 
     def _selected_devices(self):
@@ -528,16 +642,21 @@ class App(tk.Tk):
 
     def _do_check(self, dev):
         """Worker body: query one device and store the resulting status."""
-        fid, build, err = fetch_version(dev)
-        st = {"fw_id": fid, "build": build or "", "detail": err}
+        fid, build, md5, err = fetch_version(dev)
+        st = {"fw_id": fid, "build": build or "", "md5": md5 or "", "detail": err}
         # Compare against the (possibly overridden) target firmware.
         tid = dev.get("target") or fid or ""
         fw = self.cfg["firmware"].get(tid)
-        st["status"] = compute_status(fid, build, fw)
+        st["status"] = compute_status(fid, build, fw, md5)
         if st["status"] == ST_NOBIN and not st["detail"]:
             st["detail"] = "no binary linked for '%s'" % tid
         elif st["status"] == ST_UPD and fw:
-            st["detail"] = "available build %s" % local_build(fw)
+            if md5 and build and build == local_build(fw):
+                st["detail"] = "same build, different binary (md5 differs)"
+            else:
+                st["detail"] = "available build %s" % local_build(fw)
+        elif st["status"] == ST_NEWER and md5:
+            st["detail"] = "device build is higher and md5 differs from linked binary"
         self.state[dev["name"]] = st
         self.say("%s: %s %s -> %s" % (dev["name"], fid or "unknown",
                                        build or "", st["status"]))
