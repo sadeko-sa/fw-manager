@@ -46,6 +46,7 @@ from datetime import datetime
 from urllib import request, error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter import font as tkfont
 
 # --------------------------------------------------------------------------- #
 # Constants / persistence
@@ -336,13 +337,25 @@ class App(tk.Tk):
             dev_tab, self.DEV_COLS,
             ("Name", "Host", "Reported FW", "Build", "Target FW", "Status", "Detail"),
             (140, 140, 170, 140, 170, 140, 260))
-        # Work around a Tk 8.6.9 bug where tag colors are ignored in Treeview.
+        # Remove EVERY state mapping that touches "selected" (and the Tk 8.6.9
+        # "!selected" bug entries) from the Treeview colors. Result: row tag
+        # colors always win, so the native blue selection never hides the
+        # status color. Selection is shown by our own marker/bold tags below.
         style = ttk.Style(self)
+
+        def _strip_selected(option):
+            """Return the style map entries for option without selected states."""
+            entries = style.map("Treeview", query_opt=option)
+            return [e for e in entries
+                    if not any("selected" in str(s) for s in e[:-1])]
+
         style.map("Treeview",
-                  foreground=[e for e in style.map("Treeview", query_opt="foreground")
-                              if e[:2] != ("!disabled", "!selected")],
-                  background=[e for e in style.map("Treeview", query_opt="background")
-                              if e[:2] != ("!disabled", "!selected")])
+                  foreground=_strip_selected("foreground"),
+                  background=_strip_selected("background"))
+
+        # Bold + underlined font used for selected rows.
+        self.sel_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.sel_font.configure(weight="bold", underline=True)
         # Bright, clearly different row colors per status. Foreground is set
         # explicitly (black) so text stays readable on a dark OS theme.
         status_colors = {
@@ -356,6 +369,14 @@ class App(tk.Tk):
         }
         for tag, color in status_colors.items():
             self.dev_tree.tag_configure(tag, background=color, foreground="#000000")
+        # Selected variants: SAME background (status color stays visible),
+        # only the font changes. Created after the base tags so they have
+        # higher priority in Tk's tag stacking order.
+        for tag, color in status_colors.items():
+            self.dev_tree.tag_configure(tag + "|sel", background=color,
+                                        foreground="#000000", font=self.sel_font)
+        # Re-mark rows whenever the selection changes.
+        self.dev_tree.bind("<<TreeviewSelect>>", lambda e: self._update_marks())
         # Double click = check, right click = menu.
         self.dev_tree.bind("<Double-1>", lambda e: self.check_selected())
         self.dev_tree.bind("<Button-3>", self._dev_menu)
@@ -472,6 +493,22 @@ class App(tk.Tk):
         keep = [s for s in sel if self.dev_tree.exists(s)]
         if keep:
             self.dev_tree.selection_set(keep)
+        self._update_marks()
+
+    def _update_marks(self):
+        """
+        Show selection without touching the status color: selected rows keep
+        their status background but get a bold underlined font (via the
+        "<status>|sel" tag) and a "> " marker in front of the name.
+        """
+        selected = set(self.dev_tree.selection())
+        for iid in self.dev_tree.get_children():
+            status = self.dev_tree.set(iid, "status")
+            is_sel = iid in selected
+            tags = (status, status + "|sel") if is_sel else (status,)
+            self.dev_tree.item(iid, tags=tags)
+            # iid is the device name; prefix the marker only for display.
+            self.dev_tree.set(iid, "name", ("\u25ba " if is_sel else "") + iid)
 
     def _refresh_firmware(self):
         """Rebuild the firmware registry tree."""
