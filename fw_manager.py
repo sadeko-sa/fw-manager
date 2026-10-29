@@ -10,21 +10,26 @@ What it does
   "md5":"<32 hex>"} - md5 is optional, on ESP8266/ESP32 use ESP.getSketchMD5()).
 * Shows firmware id, build, and an update status per device:
     UP TO DATE | UPDATE AVAILABLE | NEWER ON DEVICE | NO BINARY LINKED | UNKNOWN FW
-* Keeps a firmware registry: firmware id -> binary file + install command
+* Keeps a firmware registry: firmware id -> binary file + upload command
   template + (optional) manual build number.
-* Per-device actions: Check (re-read version), Update (run the install
+* Per-device actions: Check (re-read version), Update (run the upload
   command template), Link binary (create/edit the registry entry).
 * Everything is persisted to fwmanager.json next to this script.
 
-Command template placeholders
------------------------------
+Variables and upload commands (fwmanager.properties)
+----------------------------------------------------
+One properties file next to this script (created on first start, re-read on
+every install, open it via File > Open variables file):
+  name=value        any number of your own variables, used as {name}
+  cmd.<id>=...      an upload command; pick it by <id> in the Firmware tab
+Lines starting with # are comments. Variables may reference other variables,
+built-ins and environment variables (%NAME%). A path value with * uses the
+newest match (e.g. a core folder whose version changes).
+Built-in placeholders:
   {host}  device host/IP        {port}  device port (default 80)
   {name}  device name           {id}    firmware id being installed
   {file}  path of linked binary {build} build number of the binary
-Examples:
-  curl -sS -F "file=@{file}" http://{host}/update
-  python espota.py -i {host} -f "{file}"
-  arduino-cli upload -i "{file}" -p {host} --fqbn esp8266:esp8266:nodemcuv2
+A firmware "Upload command" value that is not a known id is used as a raw template.
 
 MD5 check (when the device reports "md5"):
   md5 equal to the md5 of the linked binary  -> UP TO DATE (build ignored)
@@ -43,6 +48,7 @@ Build number of a binary (first match wins):
 Requirements: Python 3.8+, tkinter (bundled with the standard installers).
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -69,8 +75,35 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Seconds to wait for a device to answer a version request.
 HTTP_TIMEOUT = 3.0
 
-# Default install command used when a registry entry has none.
-DEFAULT_CMD = 'curl -sS -F "file=@{file}" http://{host}:{port}/update'
+# Variables + upload command presets live in one properties file.
+PROPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "fwmanager.properties")
+
+# Upload command id used when a registry entry has none.
+DEFAULT_CMD = "curl"
+
+# Presets that always exist (the properties file can override them).
+BUILTIN_PRESETS = {
+    "curl": 'curl -sS -F "file=@{file}" http://{host}:{port}/update',
+}
+
+SEED_PROPS = r"""# Firmware Manager variables and upload commands.
+# name=value       variable, use it as {name} in values and commands
+# cmd.<id>=...     upload command, selected by <id> in the Firmware tab
+# Built-ins: {host} {port} {name} {id} {file} {build}
+# Environment variables like %LOCALAPPDATA% are expanded in variable values.
+
+# A path with * uses the newest match.
+# OTA upload commands: pick esp8266ota or esp32ota in the Firmware tab
+# (Upload command id).
+esp8266ota_py=%LOCALAPPDATA%\Arduino15\packages\esp8266\hardware\esp8266\*\tools\espota.py
+esp32ota_py=%LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\*\tools\espota.py
+
+cmd.esp8266ota=python "{esp8266ota_py}" -i {host} -p 8266 -f "{file}"
+cmd.esp32ota=python "{esp32ota_py}" -i {host} -p 3232 -f "{file}"
+
+cmd.curl=curl -sS -F "file=@{file}" http://{host}:{port}/update
+"""
 
 def hidden_process_kwargs():
     """
@@ -134,6 +167,85 @@ def save_config(cfg):
     """Write config to disk (pretty printed so it is hand-editable)."""
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+
+def ensure_props_file():
+    """Create the properties file with examples if it does not exist."""
+    if not os.path.isfile(PROPS_FILE):
+        with open(PROPS_FILE, "w", encoding="utf-8") as f:
+            f.write(SEED_PROPS)
+
+
+def load_props():
+    """Read the properties file. Returns (variables, commands) dicts."""
+    ensure_props_file()
+    variables, cmds = {}, dict(BUILTIN_PRESETS)
+    try:
+        with open(PROPS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line[0] in "#!" or "=" not in line:
+                    continue
+                key, val = (x.strip() for x in line.split("=", 1))
+                if key.startswith("cmd."):
+                    cmds[key[4:]] = val
+                elif key:
+                    variables[key] = val
+    except OSError:
+        pass
+    return variables, cmds
+
+
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][\w.\-]*)\}")
+
+
+def expand(text, builtins, variables, _stack=()):
+    """
+    Replace every {name} in text. Built-ins win over file variables; file
+    variables may reference other variables. Raises KeyError for an unknown
+    name and ValueError for a circular reference.
+    """
+    def sub(m):
+        key = m.group(1)
+        if key in builtins:
+            return str(builtins[key])
+        if key in variables:
+            if key in _stack:
+                raise ValueError("circular variable {%s}" % key)
+            return newest_match(expand(os.path.expandvars(variables[key]),
+                                       builtins, variables, _stack + (key,)))
+        raise KeyError(key)
+    return _PLACEHOLDER.sub(sub, text)
+
+
+def newest_match(pattern):
+    """If pattern has * or ?, return the highest-versioned match (else as is)."""
+    if not any(c in pattern for c in "*?"):
+        return pattern
+    hits = glob.glob(pattern)
+    if not hits:
+        return pattern
+    return max(hits, key=lambda h: [(int(x), "") if x.isdigit() else (-1, x)
+                                    for x in re.split(r"(\d+)", h)])
+
+
+def resolve_command(value, builtins):
+    """
+    Turn a firmware 'cmd' value (command id or raw template) into a command.
+    Precedence: built-ins > name.
+    """
+    variables, cmds = load_props()
+    return expand(cmds.get(value or DEFAULT_CMD, value), builtins, variables)
+
+
+def open_path(path):
+    """Open a file or folder with the OS default application."""
+    if os.name == "nt":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 
 # --------------------------------------------------------------------------- #
@@ -278,12 +390,14 @@ def compute_status(reported_id, reported_build, target_fw, reported_md5=""):
 
 class FormDialog(tk.Toplevel):
     """
-    Modal form. fields = [(key, label, kind)], kind is "text" or "file".
+    Modal form. fields = [(key, label, kind)], kind is "text", "file" or a
+    list of choices (editable dropdown).
     After wait_window(), .result is a dict of values or None if cancelled.
     """
 
     def __init__(self, parent, title, fields, values=None):
         super().__init__(parent)
+        self.withdraw()
         self.title(title)
         self.transient(parent)
         self.result = None
@@ -298,8 +412,12 @@ class FormDialog(tk.Toplevel):
             ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=3)
             var = tk.StringVar(value=str(values.get(key, "")))
             self.vars[key] = var
-            ttk.Entry(frm, textvariable=var, width=60).grid(
-                row=row, column=1, sticky="ew", padx=5)
+            if isinstance(kind, (list, tuple)):
+                ttk.Combobox(frm, textvariable=var, values=list(kind),
+                             width=57).grid(row=row, column=1, sticky="ew", padx=5)
+            else:
+                ttk.Entry(frm, textvariable=var, width=60).grid(
+                    row=row, column=1, sticky="ew", padx=5)
             if kind == "file":
                 # Browse button fills the entry with a chosen file path.
                 ttk.Button(frm, text="...", width=3,
@@ -312,8 +430,18 @@ class FormDialog(tk.Toplevel):
 
         self.bind("<Return>", lambda e: self._ok())
         self.bind("<Escape>", lambda e: self.destroy())
+        self._center(parent)
+        self.deiconify()
         self.grab_set()
         self.wait_window(self)
+
+    def _center(self, parent):
+        """Place the dialog in the middle of its parent window."""
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        self.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
 
     def _browse(self, var):
         """Open a file chooser and store the selection in var."""
@@ -352,6 +480,7 @@ class App(tk.Tk):
         self.q = queue.Queue()
 
         self._build_ui()
+        self._build_menubar()
         self._refresh_devices()
         self._refresh_firmware()
         self.after(100, self._pump)      # start queue pump
@@ -404,9 +533,16 @@ class App(tk.Tk):
             return [e for e in entries
                     if not any("selected" in str(s) for s in e[:-1])]
 
-        style.map("Treeview",
+        style.map("Dev.Treeview",
                   foreground=_strip_selected("foreground"),
                   background=_strip_selected("background"))
+        self.dev_tree.configure(style="Dev.Treeview")
+        # Every other tree (firmware registry) shows a clear blue selection.
+        style.map("Treeview",
+                  foreground=_strip_selected("foreground")
+                  + [("selected", "#ffffff")],
+                  background=_strip_selected("background")
+                  + [("selected", "#1f6feb")])
 
         # Bold + underlined font used for selected rows.
         self.sel_font = tkfont.nametofont("TkDefaultFont").copy()
@@ -432,9 +568,9 @@ class App(tk.Tk):
                                         foreground="#000000", font=self.sel_font)
         # Re-mark rows whenever the selection changes.
         self.dev_tree.bind("<<TreeviewSelect>>", lambda e: self._update_marks())
-        # Double click = check (right click is bound inside _make_tree:
+        # Double click = edit device (right click is bound inside _make_tree:
         # header -> column chooser, row -> device menu).
-        self.dev_tree.bind("<Double-1>", lambda e: self.check_selected())
+        self.dev_tree.bind("<Double-1>", lambda e: self.edit_device())
 
         # ---- Firmware tab ----
         fw_tab = ttk.Frame(nb)
@@ -449,7 +585,7 @@ class App(tk.Tk):
         self.fw_tree = self._make_tree(
             fw_tab, self.FW_COLS,
             ("Firmware ID", "Binary file", "Build (manual/auto)", "File MD5",
-             "Install command"),
+             "Upload command (id)"),
             (180, 320, 140, 250, 340), "fw")
         self.fw_tree.bind("<Double-1>", lambda e: self.edit_fw())
 
@@ -470,6 +606,57 @@ class App(tk.Tk):
         self.menu.add_separator()
         self.menu.add_command(label="Edit", command=self.edit_device)
         self.menu.add_command(label="Remove", command=self.remove_device)
+
+    def _build_menubar(self):
+        """Create the window menu bar (File / Devices / Firmware)."""
+        bar = tk.Menu(self)
+
+        m = tk.Menu(bar, tearoff=0)
+        m.add_command(label="Open variables file", command=self.open_props)
+        m.add_command(label="Show variables and commands", command=self.show_props)
+        m.add_command(label="Open config folder",
+                      command=lambda: open_path(os.path.dirname(CONFIG_FILE)))
+        m.add_separator()
+        m.add_command(label="Exit", command=self.destroy)
+        bar.add_cascade(label="File", menu=m)
+
+        m = tk.Menu(bar, tearoff=0)
+        for label, cmd in (("Scan all", self.scan_all),
+                           ("Check", self.check_selected),
+                           ("Update", self.update_selected),
+                           ("Update all outdated", self.update_all_outdated),
+                           ("Link binary", self.link_selected),
+                           (None, None),
+                           ("Add", self.add_device),
+                           ("Edit", self.edit_device),
+                           ("Remove", self.remove_device)):
+            if label:
+                m.add_command(label=label, command=cmd)
+            else:
+                m.add_separator()
+        bar.add_cascade(label="Devices", menu=m)
+
+        m = tk.Menu(bar, tearoff=0)
+        m.add_command(label="Add", command=self.add_fw)
+        m.add_command(label="Edit", command=self.edit_fw)
+        m.add_command(label="Remove", command=self.remove_fw)
+        bar.add_cascade(label="Firmware", menu=m)
+
+        self.configure(menu=bar)
+
+    def open_props(self):
+        """Open the variables file in the default editor."""
+        ensure_props_file()
+        open_path(PROPS_FILE)
+
+    def show_props(self):
+        """Write all variables and command ids to the log pane."""
+        variables, cmds = load_props()
+        self.say("%s:" % PROPS_FILE)
+        for k, v in variables.items():
+            self.say("  %s = %s" % (k, v))
+        for k, v in cmds.items():
+            self.say("  cmd.%s = %s" % (k, v))
 
     def _make_tree(self, parent, cols, heads, widths, key, row_menu=None):
         """
@@ -660,6 +847,18 @@ class App(tk.Tk):
         self.state[dev["name"]] = st
         self.say("%s: %s %s -> %s" % (dev["name"], fid or "unknown",
                                        build or "", st["status"]))
+        if fid:
+            file_md = file_md5(fw["file"]) if fw and fw.get("file") else ""
+            if not md5:
+                self.say("%s: md5 not reported by device" % dev["name"])
+            elif not file_md:
+                self.say("%s: md5 not compared (no readable binary for '%s')"
+                         % (dev["name"], tid))
+            elif md5.strip().lower() == file_md:
+                self.say("%s: md5 MATCH (%s)" % (dev["name"], md5))
+            else:
+                self.say("%s: md5 DIFFERENT (device %s, file %s)"
+                         % (dev["name"], md5, file_md))
 
     def _run_checks(self, devs):
         """Check several devices in parallel, then refresh the table."""
@@ -692,20 +891,21 @@ class App(tk.Tk):
 
     def _install(self, dev):
         """
-        Worker body: run the install command template for one device.
-        Returns True when the command exited with code 0.
+        Worker body: run the upload command template for one device.
+        Returns True when the upload command exited with code 0.
         """
         tid, fw = self._target_fw(dev)
         if not fw or not os.path.isfile(fw.get("file", "")):
             self.say("%s: no binary linked for '%s'" % (dev["name"], tid))
             return False
-        template = fw.get("cmd") or DEFAULT_CMD
         try:
-            cmd = template.format(host=dev["host"], port=dev.get("port") or 80,
-                                  name=dev["name"], id=tid, file=fw["file"],
-                                  build=local_build(fw))
-        except (KeyError, IndexError) as exc:
-            self.say("%s: bad placeholder in command: %s" % (dev["name"], exc))
+            cmd = resolve_command(fw.get("cmd"), {
+                "host": dev["host"], "port": dev.get("port") or 80,
+                "name": dev["name"], "id": tid, "file": fw["file"],
+                "build": local_build(fw)})
+        except (KeyError, ValueError) as exc:
+            self.say("%s: bad placeholder in upload command: %s"
+                     % (dev["name"], exc))
             return False
 
         self.say("%s: running: %s" % (dev["name"], cmd))
@@ -720,9 +920,9 @@ class App(tk.Tk):
                 self.say("  %s | %s" % (dev["name"], line.rstrip()))
             code = proc.wait()
         except OSError as exc:
-            self.say("%s: failed to start command: %s" % (dev["name"], exc))
+            self.say("%s: failed to start upload command: %s" % (dev["name"], exc))
             return False
-        self.say("%s: command exited with code %s" % (dev["name"], code))
+        self.say("%s: upload command exited with code %s" % (dev["name"], code))
         return code == 0
 
     def _run_updates(self, devs):
@@ -749,7 +949,7 @@ class App(tk.Tk):
         if not devs:
             return
         names = ", ".join(d["name"] for d in devs)
-        if messagebox.askyesno("Update", "Install firmware on: %s ?" % names):
+        if messagebox.askyesno("Update", "Upload firmware to: %s ?" % names):
             self._run_updates(devs)
 
     def update_all_outdated(self):
@@ -766,10 +966,13 @@ class App(tk.Tk):
 
     # ----------------------------------------------------- device editing --
 
-    DEV_FIELDS = [("name", "Name", "text"), ("host", "Host / IP", "text"),
-                  ("port", "Port (default 80)", "text"),
-                  ("version_path", "Version path (default /version)", "text"),
-                  ("target", "Target FW id (empty = same as reported)", "text")]
+    @property
+    def DEV_FIELDS(self):
+        """Device form fields."""
+        return [("name", "Name", "text"), ("host", "Host / IP", "text"),
+                ("port", "Port (default 80)", "text"),
+                ("version_path", "Version path (default /version)", "text"),
+                ("target", "Target FW id (empty = same as reported)", "text")]
 
     def add_device(self):
         """Add a new device and check it immediately."""
@@ -816,9 +1019,12 @@ class App(tk.Tk):
 
     # ----------------------------------------------------- firmware editing --
 
-    FW_FIELDS = [("id", "Firmware id", "text"), ("file", "Binary file", "file"),
-                 ("build", "Build (empty = auto)", "text"),
-                 ("cmd", "Install command template", "text")]
+    @property
+    def FW_FIELDS(self):
+        """Firmware form fields; the command dropdown lists every command id."""
+        return [("id", "Firmware id", "text"), ("file", "Binary file", "file"),
+                ("build", "Build (empty = auto)", "text"),
+                ("cmd", "Upload command id", sorted(load_props()[1]))]
 
     def _store_fw(self, res, old_id=None):
         """Save a firmware form result, handling renames."""
