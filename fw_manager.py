@@ -39,6 +39,9 @@ MD5 check (when the device reports "md5"):
 
 Columns: right click a column header to show/hide columns (saved in the config).
 
+UI state: window geometry, maximized state, log pane height and
+column widths are saved to the config ("ui" key) on exit and restored on start.
+
 Build number of a binary (first match wins):
   1. manual "build" field in the registry entry
   2. sidecar file "<binary>.json" containing {"build": ...}
@@ -94,13 +97,13 @@ SEED_PROPS = r"""# Firmware Manager variables and upload commands.
 # Environment variables like %LOCALAPPDATA% are expanded in variable values.
 
 # A path with * uses the newest match.
-# OTA upload commands: pick esp8266ota or esp32ota in the Firmware tab
+# OTA upload commands: pick espota8266 or espota32 in the Firmware tab
 # (Upload command id).
-esp8266ota_py=%LOCALAPPDATA%\Arduino15\packages\esp8266\hardware\esp8266\*\tools\espota.py
-esp32ota_py=%LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\*\tools\espota.py
+espota8266=%LOCALAPPDATA%\Arduino15\packages\esp8266\hardware\esp8266\*\tools\espota.py
+espota32=%LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\*\tools\espota.py
 
-cmd.esp8266ota=python "{esp8266ota_py}" -i {host} -p 8266 -f "{file}"
-cmd.esp32ota=python "{esp32ota_py}" -i {host} -p 3232 -f "{file}"
+cmd.espota8266=python "{espota8266}" -i {host} -p 8266 -f "{file}"
+cmd.espota32=python "{espota32}" -i {host} -p 3232 -f "{file}"
 
 cmd.curl=curl -sS -F "file=@{file}" http://{host}:{port}/update
 """
@@ -468,9 +471,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Firmware Manager")
-        self.geometry("1100x640")
 
         self.cfg = load_config()
+        self.geometry(self.cfg.get("ui", {}).get("geometry") or "1100x640")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Runtime (non-persisted) state per device name:
         # {"fw_id", "build", "status", "detail"}
         self.state = {}
@@ -483,6 +487,7 @@ class App(tk.Tk):
         self._build_menubar()
         self._refresh_devices()
         self._refresh_firmware()
+        self._restore_ui()
         self.after(100, self._pump)      # start queue pump
         self.after(300, self.scan_all)   # auto scan on start
 
@@ -490,10 +495,10 @@ class App(tk.Tk):
 
     def _build_ui(self):
         """Create notebook, toolbars, trees and the log pane."""
-        paned = ttk.PanedWindow(self, orient="vertical")
+        paned = self.paned = ttk.PanedWindow(self, orient="vertical")
         paned.pack(fill="both", expand=True)
 
-        nb = ttk.Notebook(paned)
+        nb = self.nb = ttk.Notebook(paned)
         paned.add(nb, weight=4)
 
         # ---- Devices tab ----
@@ -552,8 +557,8 @@ class App(tk.Tk):
         status_colors = {
             ST_OK:      "#3ddc84",   # bright green
             ST_UPD:     "#ffd400",   # bright yellow
-            ST_NEWER:   "#4da6ff",   # bright blue
-            ST_NOBIN:   "#2fe0e0",   # bright cyan
+            ST_NEWER:   "#9ed842",   # bright green-yellow
+            ST_NOBIN:   "#ff4d4d",   # bright red
             ST_UNKNOWN: "#ff4d4d",   # bright red
             ST_BUSY:    "#d28bff",   # bright purple
             "?":        "#bdbdbd",   # light gray = not checked yet
@@ -617,7 +622,7 @@ class App(tk.Tk):
         m.add_command(label="Open config folder",
                       command=lambda: open_path(os.path.dirname(CONFIG_FILE)))
         m.add_separator()
-        m.add_command(label="Exit", command=self.destroy)
+        m.add_command(label="Exit", command=self._on_close)
         bar.add_cascade(label="File", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
@@ -673,6 +678,10 @@ class App(tk.Tk):
             # anchor="w" left-aligns the header text (default is centered).
             tree.heading(c, text=h, anchor="w")
             tree.column(c, width=w, anchor="w")
+        # Restore saved column widths.
+        for c, w in self.cfg.get("ui", {}).get("widths", {}).get(key, {}).items():
+            if c in cols and isinstance(w, int) and w >= 20:
+                tree.column(c, width=w)
         sb = ttk.Scrollbar(frame, command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -738,6 +747,44 @@ class App(tk.Tk):
         if row:
             self.dev_tree.selection_set(row)
             self.menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------ UI state --
+
+    def _restore_ui(self):
+        """Restore maximized state and log pane height."""
+        ui = self.cfg.get("ui", {})
+        if ui.get("zoomed"):
+            try:
+                # wm_state, not state: App.state is the per-device status dict.
+                self.wm_state("zoomed")
+            except tk.TclError:
+                pass
+
+        def sash():
+            h = self.paned.winfo_height()
+            log_h = ui.get("log_h")
+            if isinstance(log_h, int) and 40 <= log_h <= h - 80:
+                self.paned.sashpos(0, h - log_h)
+        self.after(200, sash)  # needs a laid-out window
+
+    def _on_close(self):
+        """Save the UI state, then quit."""
+        try:
+            zoomed = self.wm_state() == "zoomed"
+            if zoomed:
+                self.wm_state("normal")   # so geometry() is the normal size
+                self.update_idletasks()
+            ui = self.cfg.setdefault("ui", {})
+            ui["geometry"] = self.geometry()
+            ui["zoomed"] = zoomed
+            ui["log_h"] = self.paned.winfo_height() - self.paned.sashpos(0)
+            ui["widths"] = {
+                key: {c: int(t.column(c, "width")) for c in t["columns"]}
+                for key, t in (("dev", self.dev_tree), ("fw", self.fw_tree))}
+            save_config(self.cfg)
+        except (OSError, tk.TclError):
+            pass
+        self.destroy()
 
     # --------------------------------------------------------- thread glue --
 
@@ -866,12 +913,16 @@ class App(tk.Tk):
             self.busy.add(d["name"])
         self.ui(self._refresh_devices)
 
+        def one(d):
+            try:
+                self._do_check(d)
+            finally:
+                self.busy.discard(d["name"])
+                self.ui(self._refresh_devices)
+
         def job():
             with ThreadPoolExecutor(max_workers=16) as pool:
-                list(pool.map(self._do_check, devs))
-            for d in devs:
-                self.busy.discard(d["name"])
-            self.ui(self._refresh_devices)
+                list(pool.map(one, devs))
         threading.Thread(target=job, daemon=True).start()
 
     def scan_all(self):
