@@ -14,6 +14,8 @@ What it does
   template + (optional) manual build number.
 * Per-device actions: Check (re-read version), Update (run the upload
   command template), Link binary (create/edit the registry entry).
+* Devices can be disabled (Enable/Disable); disabled devices are skipped by
+  Scan all and Update all outdated, but can still be checked by hand.
 * Everything is persisted to fwmanager.json next to this script.
 
 Variables and upload commands (fwmanager.properties)
@@ -151,6 +153,7 @@ ST_NEWER = "NEWER ON DEVICE"
 ST_NOBIN = "NO BINARY LINKED"
 ST_UNKNOWN = "UNKNOWN FW"
 ST_BUSY = "WORKING..."
+ST_DISABLED = "DISABLED"
 
 
 def load_config():
@@ -512,6 +515,7 @@ class App(tk.Tk):
                           ("Update", self.update_selected),
                           ("Update all outdated", self.update_all_outdated),
                           ("Link binary", self.link_selected),
+                          ("Enable/Disable", self.toggle_disabled),
                           ("|", None),
                           ("Add", self.add_device),
                           ("Edit", self.edit_device),
@@ -552,25 +556,28 @@ class App(tk.Tk):
         # Bold + underlined font used for selected rows.
         self.sel_font = tkfont.nametofont("TkDefaultFont").copy()
         self.sel_font.configure(weight="bold", underline=True)
-        # Bright, clearly different row colors per status. Foreground is set
-        # explicitly (black) so text stays readable on a dark OS theme.
+        TEXT_FG = "#d4d4d4"   # soft light gray, easier on the eyes than pure white
+        # Dark, clearly different row colors per status with soft light text.
         status_colors = {
-            ST_OK:      "#3ddc84",   # bright green
-            ST_UPD:     "#ffd400",   # bright yellow
-            ST_NEWER:   "#9ed842",   # bright green-yellow
-            ST_NOBIN:   "#ff4d4d",   # bright red
-            ST_UNKNOWN: "#ff4d4d",   # bright red
-            ST_BUSY:    "#d28bff",   # bright purple
-            "?":        "#bdbdbd",   # light gray = not checked yet
+            ST_OK:      "#1b5e38",   # dark green
+            ST_UPD:     "#6b5a12",   # dark yellow
+            ST_NEWER:   "#44601f",   # dark olive green
+            ST_NOBIN:   "#6b1f1f",   # dark red
+            ST_UNKNOWN: "#6b1f1f",   # dark red
+            ST_BUSY:    "#4a2f73",   # dark purple
+            "?":        "#3a3a3a",   # dark gray = not checked yet
+            ST_DISABLED: "#262626",  # almost black, dimmed text
         }
         for tag, color in status_colors.items():
-            self.dev_tree.tag_configure(tag, background=color, foreground="#000000")
+            fg = "#808080" if tag == ST_DISABLED else TEXT_FG
+            self.dev_tree.tag_configure(tag, background=color, foreground=fg)
         # Selected variants: SAME background (status color stays visible),
         # only the font changes. Created after the base tags so they have
         # higher priority in Tk's tag stacking order.
         for tag, color in status_colors.items():
+            fg = "#808080" if tag == ST_DISABLED else TEXT_FG
             self.dev_tree.tag_configure(tag + "|sel", background=color,
-                                        foreground="#000000", font=self.sel_font)
+                                        foreground=fg, font=self.sel_font)
         # Re-mark rows whenever the selection changes.
         self.dev_tree.bind("<<TreeviewSelect>>", lambda e: self._update_marks())
         # Double click = edit device (right click is bound inside _make_tree:
@@ -608,6 +615,7 @@ class App(tk.Tk):
         self.menu.add_command(label="Check", command=self.check_selected)
         self.menu.add_command(label="Update", command=self.update_selected)
         self.menu.add_command(label="Link binary", command=self.link_selected)
+        self.menu.add_command(label="Enable/Disable", command=self.toggle_disabled)
         self.menu.add_separator()
         self.menu.add_command(label="Edit", command=self.edit_device)
         self.menu.add_command(label="Remove", command=self.remove_device)
@@ -631,6 +639,7 @@ class App(tk.Tk):
                            ("Update", self.update_selected),
                            ("Update all outdated", self.update_all_outdated),
                            ("Link binary", self.link_selected),
+                           ("Enable/Disable", self.toggle_disabled),
                            (None, None),
                            ("Add", self.add_device),
                            ("Edit", self.edit_device),
@@ -830,7 +839,9 @@ class App(tk.Tk):
         for dev in self.cfg["devices"]:
             st = self.state.get(dev["name"], {})
             tid, _ = self._target_fw(dev)
-            status = ST_BUSY if dev["name"] in self.busy else st.get("status", "?")
+            status = st.get("status", "?")
+            if dev.get("disabled"): status = ST_DISABLED
+            if dev["name"] in self.busy: status = ST_BUSY
             self.dev_tree.insert(
                 "", "end", iid=dev["name"],
                 values=(dev["name"], dev["host"],
@@ -926,8 +937,9 @@ class App(tk.Tk):
         threading.Thread(target=job, daemon=True).start()
 
     def scan_all(self):
-        """Check every saved device."""
-        devs = [d for d in self.cfg["devices"] if d["name"] not in self.busy]
+        """Check every saved device that is not disabled."""
+        devs = [d for d in self.cfg["devices"]
+                if d["name"] not in self.busy and not d.get("disabled")]
         if devs:
             self.say("Scanning %d device(s)..." % len(devs))
             self._run_checks(devs)
@@ -1006,7 +1018,7 @@ class App(tk.Tk):
         """Update every device whose status is UPDATE AVAILABLE."""
         devs = [d for d in self.cfg["devices"]
                 if self.state.get(d["name"], {}).get("status") == ST_UPD
-                and d["name"] not in self.busy]
+                and d["name"] not in self.busy and not d.get("disabled")]
         if not devs:
             self.say("Nothing to update.")
             return
@@ -1052,11 +1064,24 @@ class App(tk.Tk):
             self.cfg["devices"].append(res)
         else:
             self.state.pop(old["name"], None)
+            disabled = old.get("disabled")
             old.clear()
             old.update(res)
+            if disabled: old["disabled"] = True
         save_config(self.cfg)
         self._refresh_devices()
         self._run_checks([res if old is None else old])
+
+    def toggle_disabled(self):
+        """Disable the selected devices (enable them if all are already disabled)."""
+        sel = self._selected_devices()
+        if not sel: return
+        off = not all(d.get("disabled") for d in sel)
+        for d in sel:
+            if off: d["disabled"] = True
+            else: d.pop("disabled", None)
+        save_config(self.cfg)
+        self._refresh_devices()
 
     def remove_device(self):
         """Remove the selected devices from the saved list."""
