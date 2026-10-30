@@ -1025,8 +1025,9 @@ class App(tk.Tk):
                 ("target", "Target FW id (empty = same as reported)", "text")]
 
     def add_device(self):
-        """Add a new device and check it immediately."""
-        dlg = FormDialog(self, "Add device", self.DEV_FIELDS)
+        """Add a new device (form pre-filled from the selected device) and check it."""
+        sel = self._selected_devices()
+        dlg = FormDialog(self, "Add device", self.DEV_FIELDS, sel[0] if sel else None)
         self._store_device(dlg.result, None)
 
     def edit_device(self):
@@ -1091,8 +1092,10 @@ class App(tk.Tk):
         self.scan_all()
 
     def add_fw(self):
-        """Add a registry entry."""
-        dlg = FormDialog(self, "Add firmware", self.FW_FIELDS, {"cmd": DEFAULT_CMD})
+        """Add a registry entry (form pre-filled from the selected entry)."""
+        sel = self.fw_tree.selection()
+        vals = dict(self.cfg["firmware"][sel[0]], id=sel[0]) if sel else {"cmd": DEFAULT_CMD}
+        dlg = FormDialog(self, "Add firmware", self.FW_FIELDS, vals)
         self._store_fw(dlg.result)
 
     def edit_fw(self):
