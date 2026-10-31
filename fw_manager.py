@@ -31,6 +31,8 @@ One properties file next to this script (created on first start, re-read on
 every install, open it via Settings > Open variables file):
   name=value        any number of your own variables, used as {name}
   cmd.<id>=...      an upload command; pick it by <id> in the Firmware tab
+  http_timeout=3    seconds to wait for a device to answer (default 3);
+                    read once at program start
 Lines starting with # are comments. Variables may reference other variables,
 built-ins and environment variables (%NAME%). A path value with * uses the
 newest match (e.g. a core folder whose version changes).
@@ -103,8 +105,12 @@ VERSION = "1.2.0"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "fw_manager.json")
 
-# Seconds to wait for a device to answer a version request.
-HTTP_TIMEOUT = 3.0
+# Seconds to wait for a device to answer (connect / each read). The value can
+# be changed with the line  http_timeout=<seconds>  in the properties file
+# (read once at start, see load_http_timeout); this is the default used when
+# that line is missing or invalid.
+HTTP_TIMEOUT_DEFAULT = 3.0
+
 
 # Variables + upload command presets live in one properties file.
 PROPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -123,6 +129,10 @@ SEED_PROPS = r"""# Firmware Manager variables and upload commands.
 # cmd.<id>=...     upload command, selected by <id> in the Firmware tab
 # Built-ins: {host} {port} {name} {id} {file} {build}
 # Environment variables like %LOCALAPPDATA% are expanded in variable values.
+
+# Seconds to wait for a device to answer (default 3). Each request is
+# sent once; raise this if slow devices show "no answer".
+http_timeout=3
 
 # A path with * uses the newest match.
 # OTA upload commands: pick espota8266 or espota32 in the Firmware tab
@@ -244,6 +254,25 @@ def load_props():
     except OSError:
         pass
     return variables, cmds
+
+
+def load_http_timeout():
+    """
+    Seconds to wait for a device, from "http_timeout=" in the properties file.
+    Read once at program start (see HTTP_TIMEOUT).
+
+    @return  the value as a float; HTTP_TIMEOUT_DEFAULT if the line is missing
+             or not a number
+    """
+    try:
+        value = float(load_props()[0].get("http_timeout", ""))
+    except ValueError:
+        return HTTP_TIMEOUT_DEFAULT
+    return value
+
+
+HTTP_TIMEOUT = load_http_timeout()
+"""Seconds to wait for a device to answer; read once at start from the properties file."""
 
 
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][\w.\-]*)\}")
