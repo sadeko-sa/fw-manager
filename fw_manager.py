@@ -23,10 +23,10 @@ What it does
   TCP: raw text + newline to the device port.
 * Devices can be disabled (Enable/Disable); disabled devices are skipped by
   Scan all and Update all outdated, but can still be checked by hand.
-* Everything is persisted to fwmanager.json next to this script.
+* Everything is persisted to fw_manager.json next to this script.
 
-Variables and upload commands (fwmanager.properties)
-----------------------------------------------------
+Variables and upload commands (fw_manager.properties)
+-----------------------------------------------------
 One properties file next to this script (created on first start, re-read on
 every install, open it via File > Open variables file):
   name=value        any number of your own variables, used as {name}
@@ -52,6 +52,13 @@ Columns: right click a column header to show/hide columns (saved in the config).
 UI state: window geometry, maximized state, log pane height and
 column widths are saved to the config ("ui" key) on exit and restored on start.
 
+Colors: every color the program uses is in the config under "colors", in four
+groups: "log" (log line text), "status" (device row background per status),
+"table" (device row text) and "selection" (selected firmware row). Values are
+#rrggbb or a Tk color name. Edit them with File > Colors... or by hand while
+the program is closed; they are used the next time the program starts. A
+missing or invalid entry falls back to the built-in default.
+
 Build number of a binary (first match wins):
   1. manual "build" field in the registry entry
   2. sidecar file "<binary>.json" containing {"build": ...}
@@ -75,7 +82,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib import request, error, parse
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 from tkinter import font as tkfont
 
 # --------------------------------------------------------------------------- #
@@ -87,14 +94,14 @@ VERSION = "1.1.0"
 
 # Config file lives next to the script so the tool is portable.
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "fwmanager.json")
+                           "fw_manager.json")
 
 # Seconds to wait for a device to answer a version request.
 HTTP_TIMEOUT = 3.0
 
 # Variables + upload command presets live in one properties file.
 PROPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "fwmanager.properties")
+                          "fw_manager.properties")
 
 # Upload command id used when a registry entry has none.
 DEFAULT_CMD = "curl"
@@ -167,6 +174,73 @@ ST_UNKNOWN = "UNKNOWN FW"
 ST_BUSY = "WORKING..."
 ST_DISABLED = "DISABLED"
 
+# Every color the program uses, in groups. These are the built-in defaults;
+# the user's values live in the config under "colors" with the same layout.
+DEFAULT_COLORS = {
+    # Log line text (light colors, for a dark log).
+    "log": {
+        "err":  "#c75450",    # red: failures
+        "warn": "#ffb454",    # amber: needs attention
+        "ok":   "#6fdc8c",    # green: success
+        "info": "#6cb6ff",    # blue: sent text, upload command
+        "dim":  "#8b949e",    # gray: timestamps, raw tool output
+    },
+    # Device table row background per status.
+    "status": {
+        ST_OK:       "#1b5e38",   # dark green
+        ST_UPD:      "#6b5a12",   # dark yellow
+        ST_NEWER:    "#44601f",   # dark olive green
+        ST_NOBIN:    "#6b1f1f",   # dark red
+        ST_UNKNOWN:  "#6b1f1f",   # dark red
+        ST_BUSY:     "#4a2f73",   # dark purple
+        "?":         "#3a3a3a",   # dark gray = not checked yet
+        ST_DISABLED: "#262626",   # almost black
+    },
+    # Device table row text.
+    "table": {
+        "text":          "#d4d4d4",   # soft light gray
+        "disabled_text": "#808080",   # dimmed, for DISABLED rows
+    },
+    # Selected row in the firmware table.
+    "selection": {
+        "text":       "#ffffff",
+        "background": "#1f6feb",
+    },
+}
+# Row descriptions for the File > Colors... dialog.
+COLOR_LABELS = {
+    "log": {
+        "err":  "Errors and failures",
+        "warn": "Warnings (md5 differs, update available)",
+        "ok":   "Success (md5 match, update finished)",
+        "info": "Sent text and upload command",
+        "dim":  "Timestamps and upload tool output",
+    },
+    "status": {
+        ST_OK:       "UP TO DATE row",
+        ST_UPD:      "UPDATE AVAILABLE row",
+        ST_NEWER:    "NEWER ON DEVICE row",
+        ST_NOBIN:    "NO BINARY LINKED row",
+        ST_UNKNOWN:  "UNKNOWN FW row",
+        ST_BUSY:     "WORKING... row",
+        "?":         "Not checked yet row",
+        ST_DISABLED: "DISABLED row",
+    },
+    "table": {
+        "text":          "Text in device rows",
+        "disabled_text": "Text in DISABLED rows",
+    },
+    "selection": {
+        "text":       "Selected row text",
+        "background": "Selected row background",
+    },
+}
+# Log color for each device status line.
+STATUS_LOG_TAG = {
+    ST_OK: "ok", ST_UPD: "warn", ST_NEWER: "ok",
+    ST_NOBIN: "err", ST_UNKNOWN: "err",
+}
+
 
 def load_config():
     """Load config from disk; return an empty structure if missing/corrupt."""
@@ -206,6 +280,48 @@ def save_config(cfg):
     """Write config to disk (pretty printed so it is hand-editable)."""
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+
+def seed_colors(cfg):
+    """
+    Make sure cfg["colors"] lists every color (group -> name -> color) so they
+    can be seen and edited in the config file. Colors saved by an earlier
+    version under cfg["ui"]["log_colors"] are moved into cfg["colors"]["log"].
+    Returns True if anything was added or moved.
+    """
+    changed = False
+    colors = cfg.get("colors")
+    if not isinstance(colors, dict):
+        colors = cfg["colors"] = {}
+        changed = True
+    ui = cfg.get("ui")
+    old = ui.pop("log_colors", None) if isinstance(ui, dict) else None
+    if old is not None:
+        changed = True
+    for group, defaults in DEFAULT_COLORS.items():
+        sub = colors.get(group)
+        if not isinstance(sub, dict):
+            sub = colors[group] = {}
+            changed = True
+        if group == "log" and isinstance(old, dict):
+            for name, color in old.items():
+                if name in defaults and name not in sub:
+                    sub[name] = color
+        for name, color in defaults.items():
+            if name not in sub:
+                sub[name] = color
+                changed = True
+    return changed
+
+
+def cfg_color(cfg, group, name):
+    """Color for (group, name) from the config, or the built-in default."""
+    default = DEFAULT_COLORS[group][name]
+    try:
+        value = cfg["colors"][group][name]
+    except (KeyError, TypeError):
+        return default
+    return value if isinstance(value, str) else default
 
 
 def ensure_props_file():
@@ -536,6 +652,156 @@ class FormDialog(tk.Toplevel):
         self.destroy()
 
 
+class ColorsDialog(tk.Toplevel):
+    """
+    Modal editor for every program color: one scrollable column with one
+    section per group (the first part of the id).
+    colors = {group: {name: color}} (same layout as DEFAULT_COLORS).
+    Each row has a description, the id, a swatch of the color, a text entry
+    (#rrggbb or a color name) and a Pick button for the system color chooser.
+    The swatches only live inside this dialog; nothing in the main window
+    changes. After wait_window(), .result is the new colors dict or None if
+    cancelled.
+    """
+
+    def __init__(self, parent, colors):
+        super().__init__(parent)
+        self.withdraw()
+        self.title("Colors")
+        self.transient(parent)
+        self.result = None
+        self.vars = {}        # (group, name) -> StringVar
+        self.swatches = {}    # (group, name) -> Label
+        self.plain = self.cget("background")    # swatch color when invalid
+        # Same label widths in every section so the columns line up.
+        desc_w = max(len(COLOR_LABELS[g].get(n, n))
+                     for g, names in DEFAULT_COLORS.items() for n in names)
+        id_w = max(len("%s.%s" % (g, n))
+                   for g, names in DEFAULT_COLORS.items() for n in names)
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        # Buttons are packed first (at the bottom) so they stay visible while
+        # the list scrolls.
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Reset all to defaults", command=self._reset).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="right", padx=3)
+
+        # Scrollable area: canvas + scrollbar, the sections live in `body`.
+        area = ttk.Frame(frm)
+        area.pack(side="top", fill="both", expand=True)
+        bg = ttk.Style(self).lookup("TFrame", "background") or self.plain
+        self.canvas = tk.Canvas(area, highlightthickness=0, background=bg,
+                                yscrollincrement=30)
+        sb = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        body = ttk.Frame(self.canvas)
+        self.canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        for group, defaults in DEFAULT_COLORS.items():
+            tab = ttk.LabelFrame(body, text=group, padding=8)
+            tab.pack(fill="x", pady=(0, 8), padx=2)
+            for row, name in enumerate(defaults):
+                key = (group, name)
+                ttk.Label(tab, text=COLOR_LABELS[group].get(name, name),
+                          width=desc_w).grid(row=row, column=0, sticky="w", pady=3)
+                # The id: group.name, exactly as used in the code and the JSON.
+                ttk.Label(tab, text="%s.%s" % (group, name), width=id_w).grid(
+                    row=row, column=1, sticky="w", padx=(12, 0))
+                box = tk.Label(tab, width=8, relief="solid", borderwidth=1)
+                box.grid(row=row, column=2, padx=8)
+                self.swatches[key] = box
+                var = tk.StringVar(value=colors.get(group, {}).get(name, defaults[name]))
+                self.vars[key] = var
+                var.trace_add("write", lambda *a, k=key: self._swatch(k))
+                ttk.Entry(tab, textvariable=var, width=12).grid(row=row, column=3)
+                ttk.Button(tab, text="Pick...",
+                           command=lambda g=group, n=name: self._pick(g, n)
+                           ).grid(row=row, column=4, padx=(5, 0))
+                self._swatch(key)
+
+        # Fit the canvas to the list, but never taller than 60% of the screen.
+        self.update_idletasks()
+        self.canvas.configure(
+            width=body.winfo_reqwidth(),
+            height=min(body.winfo_reqheight(), int(self.winfo_screenheight() * 0.6)))
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind(seq, self._wheel)
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._center(parent)
+        self.deiconify()
+        self.grab_set()
+        self.wait_window(self)
+
+    def _wheel(self, event):
+        """Scroll the list with the mouse wheel."""
+        if event.num == 4:          # Linux wheel up
+            step = -1
+        elif event.num == 5:        # Linux wheel down
+            step = 1
+        else:                       # Windows / macOS
+            step = -1 if event.delta > 0 else 1
+        self.canvas.yview_scroll(step, "units")
+
+    def _center(self, parent):
+        """Place the dialog in the middle of its parent window."""
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        self.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+
+    def _valid(self, color):
+        """True if Tk understands this color (#rrggbb or a color name)."""
+        try:
+            self.winfo_rgb(color)
+        except tk.TclError:
+            return False
+        return True
+
+    def _swatch(self, key):
+        """Fill one swatch with its entry's color ('invalid' if it is bad)."""
+        color = self.vars[key].get().strip()
+        if self._valid(color):
+            self.swatches[key].configure(background=color, text="")
+        else:
+            self.swatches[key].configure(background=self.plain, text="invalid")
+
+    def _pick(self, group, name):
+        """Open the system color chooser and put the result in the entry."""
+        current = self.vars[(group, name)].get().strip()
+        opts = {"color": current} if self._valid(current) else {}
+        _rgb, hexval = colorchooser.askcolor(
+            parent=self, title=COLOR_LABELS[group].get(name, name), **opts)
+        if hexval:
+            self.vars[(group, name)].set(hexval)
+
+    def _reset(self):
+        """Put the built-in default colors into all entries (not saved yet)."""
+        for (group, name), var in self.vars.items():
+            var.set(DEFAULT_COLORS[group][name])
+
+    def _ok(self):
+        """Check every entry, then close with the new colors."""
+        bad = ["%s.%s  (%s)" % (g, n, COLOR_LABELS[g].get(n, n))
+               for (g, n), v in self.vars.items() if not self._valid(v.get().strip())]
+        if bad:
+            messagebox.showerror("Colors", "Invalid color for:\n  "
+                                 + "\n  ".join(bad), parent=self)
+            return
+        self.result = {g: {n: self.vars[(g, n)].get().strip() for n in names}
+                       for g, names in DEFAULT_COLORS.items()}
+        self.destroy()
+
+
 # --------------------------------------------------------------------------- #
 # Main application
 # --------------------------------------------------------------------------- #
@@ -552,6 +818,11 @@ class App(tk.Tk):
         self.title("Firmware Manager " + VERSION)
 
         self.cfg = load_config()
+        if seed_colors(self.cfg):
+            try:
+                save_config(self.cfg)    # so the colors show up in the file
+            except OSError:
+                pass
         self.geometry(self.cfg.get("ui", {}).get("geometry") or "1100x640")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Runtime (non-persisted) state per device name:
@@ -625,33 +896,26 @@ class App(tk.Tk):
         # Every other tree (firmware registry) shows a clear blue selection.
         style.map("Treeview",
                   foreground=_strip_selected("foreground")
-                  + [("selected", "#ffffff")],
+                  + [("selected", self._color("selection", "text"))],
                   background=_strip_selected("background")
-                  + [("selected", "#1f6feb")])
+                  + [("selected", self._color("selection", "background"))])
 
         # Bold + underlined font used for selected rows.
         self.sel_font = tkfont.nametofont("TkDefaultFont").copy()
         self.sel_font.configure(weight="bold", underline=True)
-        TEXT_FG = "#d4d4d4"   # soft light gray, easier on the eyes than pure white
-        # Dark, clearly different row colors per status with soft light text.
-        status_colors = {
-            ST_OK:      "#1b5e38",   # dark green
-            ST_UPD:     "#6b5a12",   # dark yellow
-            ST_NEWER:   "#44601f",   # dark olive green
-            ST_NOBIN:   "#6b1f1f",   # dark red
-            ST_UNKNOWN: "#6b1f1f",   # dark red
-            ST_BUSY:    "#4a2f73",   # dark purple
-            "?":        "#3a3a3a",   # dark gray = not checked yet
-            ST_DISABLED: "#262626",  # almost black, dimmed text
-        }
+        TEXT_FG = self._color("table", "text")
+        OFF_FG = self._color("table", "disabled_text")
+        # Row background per status (colors come from the config).
+        status_colors = {tag: self._color("status", tag)
+                         for tag in DEFAULT_COLORS["status"]}
         for tag, color in status_colors.items():
-            fg = "#808080" if tag == ST_DISABLED else TEXT_FG
+            fg = OFF_FG if tag == ST_DISABLED else TEXT_FG
             self.dev_tree.tag_configure(tag, background=color, foreground=fg)
         # Selected variants: SAME background (status color stays visible),
         # only the font changes. Created after the base tags so they have
         # higher priority in Tk's tag stacking order.
         for tag, color in status_colors.items():
-            fg = "#808080" if tag == ST_DISABLED else TEXT_FG
+            fg = OFF_FG if tag == ST_DISABLED else TEXT_FG
             self.dev_tree.tag_configure(tag + "|sel", background=color,
                                         foreground=fg, font=self.sel_font)
         # Re-mark rows whenever the selection changes.
@@ -704,6 +968,7 @@ class App(tk.Tk):
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.log.pack(fill="both", expand=True)
+        self._apply_log_colors()
 
         # Context menu for devices.
         self.menu = tk.Menu(self, tearoff=0)
@@ -725,6 +990,7 @@ class App(tk.Tk):
         m.add_command(label="Show variables and commands", command=self.show_props)
         m.add_command(label="Open config folder",
                       command=lambda: open_path(os.path.dirname(CONFIG_FILE)))
+        m.add_command(label="Colors...", command=self.edit_colors)
         m.add_separator()
         m.add_command(label="Exit", command=self._on_close)
         bar.add_cascade(label="File", menu=m)
@@ -768,6 +1034,36 @@ class App(tk.Tk):
             self.say("  %s = %s" % (k, v))
         for k, v in cmds.items():
             self.say("  cmd.%s = %s" % (k, v))
+
+    def _color(self, group, name):
+        """Configured color if Tk accepts it, else the built-in default."""
+        value = cfg_color(self.cfg, group, name)
+        try:
+            self.winfo_rgb(value)
+        except tk.TclError:
+            return DEFAULT_COLORS[group][name]
+        return value
+
+    def _apply_log_colors(self):
+        """Set the text color of each log line kind (called once at startup)."""
+        for name in DEFAULT_COLORS["log"]:
+            self.log.tag_configure(name, foreground=self._color("log", name))
+
+    def edit_colors(self):
+        """File > Colors...: edit the colors and save them to the config."""
+        current = {g: {n: cfg_color(self.cfg, g, n) for n in names}
+                   for g, names in DEFAULT_COLORS.items()}
+        dlg = ColorsDialog(self, current)
+        if dlg.result is None:
+            return
+        self.cfg["colors"] = dlg.result
+        try:
+            save_config(self.cfg)
+        except OSError as exc:
+            messagebox.showerror("Colors", "Could not save the config:\n%s" % exc)
+            return
+        messagebox.showinfo("Colors", "Saved. The new colors are used the next "
+                                      "time the program starts.")
 
     def _make_tree(self, parent, cols, heads, widths, key, row_menu=None):
         """
@@ -907,13 +1203,17 @@ class App(tk.Tk):
         """Schedule fn on the main thread (safe to call from any thread)."""
         self.q.put(fn)
 
-    def say(self, text):
-        """Append a timestamped line to the log pane (thread safe)."""
+    def say(self, text, tag=None):
+        """
+        Append a timestamped line to the log pane (thread safe).
+        tag = one of the DEFAULT_COLORS["log"] names to color the line (None = default).
+        """
         stamp = datetime.now().strftime("%H:%M:%S")
 
         def _write():
             self.log.configure(state="normal")
-            self.log.insert("end", "[%s] %s\n" % (stamp, text))
+            self.log.insert("end", "[%s] " % stamp, "dim")
+            self.log.insert("end", "%s\n" % text, (tag,) if tag else ())
             self.log.see("end")
             self.log.configure(state="disabled")
         self.ui(_write)
@@ -1007,19 +1307,20 @@ class App(tk.Tk):
             st["detail"] = "device build is higher and md5 differs from linked binary"
         self.state[dev["name"]] = st
         self.say("%s: %s %s -> %s" % (dev["name"], fid or "unknown",
-                                       build or "", st["status"]))
+                                       build or "", st["status"]),
+                 STATUS_LOG_TAG.get(st["status"]))
         if fid:
             file_md = file_md5(fw["file"]) if fw and fw.get("file") else ""
             if not md5:
-                self.say("%s: md5 not reported by device" % dev["name"])
+                self.say("%s: md5 not reported by device" % dev["name"], "warn")
             elif not file_md:
                 self.say("%s: md5 not compared (no readable binary for '%s')"
-                         % (dev["name"], tid))
+                         % (dev["name"], tid), "warn")
             elif md5.strip().lower() == file_md:
-                self.say("%s: md5 MATCH (%s)" % (dev["name"], md5))
+                self.say("%s: md5 MATCH (%s)" % (dev["name"], md5), "ok")
             else:
                 self.say("%s: md5 DIFFERENT (device %s, file %s)"
-                         % (dev["name"], md5, file_md))
+                         % (dev["name"], md5, file_md), "warn")
 
     def _run_checks(self, devs):
         """Check several devices in parallel, then refresh the table."""
@@ -1093,11 +1394,12 @@ class App(tk.Tk):
                     if not prefix.startswith("/"):
                         prefix = "/" + prefix
                     path = prefix + parse.quote(text)
-            self.say("%s: > %s" % (dev["name"], text))
+            self.say("%s: > %s" % (dev["name"], text), "info")
             try:
                 reply = send_to_device(dev, mode, dev.get("port") or 80, path, body)
             except OSError as exc:
-                self.say("%s: send failed (%s)" % (dev["name"], getattr(exc, "reason", exc)))
+                self.say("%s: send failed (%s)" % (dev["name"], getattr(exc, "reason", exc)),
+                         "err")
                 return
             for line in (reply.splitlines() or ["(empty reply)"]):
                 self.say("  %s | %s" % (dev["name"], line))
@@ -1119,7 +1421,7 @@ class App(tk.Tk):
         else: tid, fw = self._device_fw(dev)
         if not fw or not os.path.isfile(fw.get("file", "")):
             self.say("%s: no binary linked for '%s' (chip: %s)"
-                     % (dev["name"], tid, self._chip(dev) or "unknown"))
+                     % (dev["name"], tid, self._chip(dev) or "unknown"), "err")
             return False
         try:
             cmd = resolve_command(fw.get("cmd"), {
@@ -1128,10 +1430,10 @@ class App(tk.Tk):
                 "build": local_build(fw), "chip": self._chip(dev)})
         except (KeyError, ValueError) as exc:
             self.say("%s: bad placeholder in upload command: %s"
-                     % (dev["name"], exc))
+                     % (dev["name"], exc), "err")
             return False
 
-        self.say("%s: running: %s" % (dev["name"], cmd))
+        self.say("%s: running: %s" % (dev["name"], cmd), "info")
         try:
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True,
@@ -1140,12 +1442,14 @@ class App(tk.Tk):
                                     **hidden_process_kwargs())
             # Stream the tool output into the log as it arrives.
             for line in proc.stdout:
-                self.say("  %s | %s" % (dev["name"], line.rstrip()))
+                self.say("  %s | %s" % (dev["name"], line.rstrip()), "dim")
             code = proc.wait()
         except OSError as exc:
-            self.say("%s: failed to start upload command: %s" % (dev["name"], exc))
+            self.say("%s: failed to start upload command: %s" % (dev["name"], exc),
+                     "err")
             return False
-        self.say("%s: upload command exited with code %s" % (dev["name"], code))
+        self.say("%s: upload command exited with code %s" % (dev["name"], code),
+                 "ok" if code == 0 else "err")
         return code == 0
 
     def _run_updates(self, devs, fw=None):
@@ -1160,7 +1464,8 @@ class App(tk.Tk):
         def job():
             for d in devs:
                 ok = self._install(d, fw)
-                self.say("%s: update %s" % (d["name"], "finished" if ok else "FAILED"))
+                self.say("%s: update %s" % (d["name"], "finished" if ok else "FAILED"),
+                         "ok" if ok else "err")
                 # No re-check after a successful upload; only after a failure.
                 if not ok:
                     self._do_check(d)
