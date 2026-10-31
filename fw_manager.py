@@ -14,6 +14,10 @@ What it does
   template + (optional) manual build number.
 * Per-device actions: Check (re-read version), Update (run the upload
   command template), Link binary (create/edit the registry entry).
+* Send bar: type text, press Enter; it goes to the selected device(s) and the
+  reply shows in the log. HTTP: "/path?x=1" = GET as typed, other text =
+  GET <device "Command path" field, default /cmd?q=><text>.
+  TCP: raw text + newline to the device port.
 * Devices can be disabled (Enable/Disable); disabled devices are skipped by
   Scan all and Update all outdated, but can still be checked by hand.
 * Everything is persisted to fwmanager.json next to this script.
@@ -59,12 +63,13 @@ import json
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from urllib import request, error
+from urllib import request, error, parse
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
@@ -293,6 +298,45 @@ def fetch_version(dev):
         return (m_id.group(1), (m_bd.group(1) if m_bd else ""),
                 (m_md.group(1).lower() if m_md else ""), "")
     return None, None, None, "unrecognized reply"
+
+
+def send_to_device(dev, mode, port, path, text):
+    """
+    Send text to a device and return its reply as text.
+
+    mode "TCP":  raw TCP connection to host:port, text + newline is sent,
+                 everything received until the device closes or goes quiet
+                 (HTTP_TIMEOUT) is returned.
+    otherwise:   HTTP to http://host:port/path - GET when text is empty,
+                 else POST with text as the body (text/plain).
+    Raises OSError (incl. URLError/timeouts) when the device cannot be reached.
+    """
+    if mode.upper() == "TCP":
+        chunks = []
+        with socket.create_connection((dev["host"], port), timeout=HTTP_TIMEOUT) as s:
+            s.sendall((text + "\n").encode("utf-8"))
+            try:
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            except socket.timeout:
+                pass
+        return b"".join(chunks).decode("utf-8", "replace").strip()
+
+    if not path.startswith("/"):
+        path = "/" + path
+    req = request.Request(
+        "http://%s:%s%s" % (dev["host"], port, path),
+        data=text.encode("utf-8") if text else None,
+        headers={"Content-Type": "text/plain"} if text else {})
+    try:
+        with request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", "replace").strip()
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace").strip()
+        return ("HTTP %s %s\n%s" % (exc.code, exc.reason, body)).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -604,6 +648,25 @@ class App(tk.Tk):
         # ---- Log pane ----
         log_frame = ttk.Frame(paned)
         paned.add(log_frame, weight=1)
+
+        # Send bar right below the log (console style): type, press Enter.
+        sendbar = ttk.Frame(log_frame, padding=(4, 4))
+        sendbar.pack(side="bottom", fill="x")
+        self.send_mode = tk.StringVar(value="HTTP")
+        ttk.Combobox(sendbar, textvariable=self.send_mode, values=["HTTP", "TCP"],
+                     width=6, state="readonly").pack(side="left", padx=(0, 4))
+        self.send_text = tk.StringVar()
+        ent = ttk.Entry(sendbar, textvariable=self.send_text)
+        ent.pack(side="left", fill="x", expand=True)
+        ent.bind("<Return>", lambda e: self.send_selected())
+        ent.bind("<Up>", lambda e: self._hist_move(-1))
+        ent.bind("<Down>", lambda e: self._hist_move(1))
+        self.send_entry = ent
+        self.send_hist = []   # sent texts, oldest first
+        self.send_pos = 0     # Up/Down position in send_hist
+        ttk.Button(sendbar, text="Send", command=self.send_selected).pack(
+            side="left", padx=(4, 0))
+
         self.log = tk.Text(log_frame, height=8, state="disabled", wrap="word")
         sb = ttk.Scrollbar(log_frame, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
@@ -950,6 +1013,60 @@ class App(tk.Tk):
         if devs:
             self._run_checks(devs)
 
+    # --------------------------------------------------------------- send --
+
+    def _hist_move(self, step):
+        """Up/Down in the send box: walk through previously sent texts."""
+        h = self.send_hist
+        if h:
+            self.send_pos = max(0, min(len(h), self.send_pos + step))
+            self.send_text.set(h[self.send_pos] if self.send_pos < len(h) else "")
+            self.send_entry.icursor("end")
+        return "break"
+
+    def send_selected(self):
+        """
+        Send the send-bar text to every selected device, log each reply.
+        HTTP: text starting with / is a GET of that path as typed; anything
+        else is sent as GET <device "Command path"><text> (default /cmd?q=),
+        with the text URL-encoded.
+        TCP: text + newline over a raw connection.
+        """
+        text = self.send_text.get().strip()
+        devs = [d for d in self._selected_devices() if d["name"] not in self.busy]
+        if not text or not devs:
+            return
+        mode = self.send_mode.get()
+        if not self.send_hist or self.send_hist[-1] != text:
+            self.send_hist.append(text)
+        self.send_pos = len(self.send_hist)
+        self.send_text.set("")
+
+        def one(dev):
+            path, body = "/", text
+            if mode == "HTTP":
+                body = ""
+                if text.startswith("/"):
+                    path = text
+                else:
+                    prefix = dev.get("cmd_path") or "/cmd?q="
+                    if not prefix.startswith("/"):
+                        prefix = "/" + prefix
+                    path = prefix + parse.quote(text)
+            self.say("%s: > %s" % (dev["name"], text))
+            try:
+                reply = send_to_device(dev, mode, dev.get("port") or 80, path, body)
+            except OSError as exc:
+                self.say("%s: send failed (%s)" % (dev["name"], getattr(exc, "reason", exc)))
+                return
+            for line in (reply.splitlines() or ["(empty reply)"]):
+                self.say("  %s | %s" % (dev["name"], line))
+
+        def job():
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                list(pool.map(one, devs))
+        threading.Thread(target=job, daemon=True).start()
+
     # ------------------------------------------------------------ updates --
 
     def _install(self, dev):
@@ -1034,7 +1151,8 @@ class App(tk.Tk):
         return [("name", "Name", "text"), ("host", "Host / IP", "text"),
                 ("port", "Port (default 80)", "text"),
                 ("version_path", "Version path (default /version)", "text"),
-                ("target", "Target FW id (empty = same as reported)", "text")]
+                ("target", "Target FW id (empty = same as reported)", "text"),
+                ("cmd_path", "Command path (default /cmd?q=)", "text")]
 
     def add_device(self):
         """Add a new device (form pre-filled from the selected device) and check it."""
