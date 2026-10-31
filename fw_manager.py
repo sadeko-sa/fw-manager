@@ -756,7 +756,7 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror(t("dlg.language"), t("msg.save_failed", error=exc))
             return
-        messagebox.showinfo(t("dlg.language"), t("msg.language_saved"))
+        self.say(t("msg.language_saved"), "warn")
 
     def _build_menubar(self):
         """Create the window menu bar (File / Devices / Firmware / Settings / Language)."""
