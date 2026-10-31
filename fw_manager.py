@@ -7,13 +7,16 @@ What it does
 * Keeps a list of saved devices (name + host + version endpoint).
 * Scans all devices over HTTP, reads the reported firmware info
   (expected JSON: {"id":"LED_WS2811.ino","build":20261029041512,
-  "md5":"<32 hex>"} - md5 is optional, on ESP8266/ESP32 use ESP.getSketchMD5()).
+  "md5":"<32 hex>","chip":"esp8266"} - md5 and chip are optional, on
+  ESP8266/ESP32 use ESP.getSketchMD5() and the chip family string).
 * Shows firmware id, build, and an update status per device:
     UP TO DATE | UPDATE AVAILABLE | NEWER ON DEVICE | NO BINARY LINKED | UNKNOWN FW
-* Keeps a firmware registry: firmware id -> binary file + upload command
-  template + (optional) manual build number.
+* Keeps a firmware registry: one entry per firmware id and chip, each with a
+  binary file + upload command template + (optional) manual build number.
+  An entry with an empty chip matches any chip; a chip specific entry wins.
 * Per-device actions: Check (re-read version), Update (run the upload
-  command template), Link binary (create/edit the registry entry).
+  command template), Install firmware (pick any registry entry for the
+  device's chip and flash it), Link binary (create/edit the registry entry).
 * Send bar: type text, press Enter; it goes to the selected device(s) and the
   reply shows in the log. HTTP: "/path?x=1" = GET as typed, other text =
   GET <device "Command path" field, default /cmd?q=><text>.
@@ -35,6 +38,7 @@ Built-in placeholders:
   {host}  device host/IP        {port}  device port (default 80)
   {name}  device name           {id}    firmware id being installed
   {file}  path of linked binary {build} build number of the binary
+  {chip}  chip family of the device
 A firmware "Upload command" value that is not a known id is used as a raw template.
 
 MD5 check (when the device reports "md5"):
@@ -77,6 +81,9 @@ from tkinter import font as tkfont
 # --------------------------------------------------------------------------- #
 # Constants / persistence
 # --------------------------------------------------------------------------- #
+
+# Shown in the window title.
+VERSION = "1.1.0"
 
 # Config file lives next to the script so the tool is portable.
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -170,8 +177,29 @@ def load_config():
         data = {}
     # Guarantee both top-level keys exist.
     data.setdefault("devices", [])
-    data.setdefault("firmware", {})
+    data.setdefault("firmware", [])
+    for d in data["devices"]: d.pop("target", None)
+    # Old format: dict id -> entry. Becomes a list of entries with id and chip.
+    if isinstance(data["firmware"], dict):
+        data["firmware"] = [{"id": k, "chip": "", **v} for k, v in data["firmware"].items()]
+        # Show the new chip columns once.
+        for key, after in (("dev", "fw_id"), ("fw", "id")):
+            cols = data.get("columns", {}).get(key)
+            if cols and after in cols: cols.insert(cols.index(after) + 1, "chip")
     return data
+
+
+def find_fw(cfg, fid, chip=""):
+    """
+    Return the registry entry for a firmware id and chip, or None.
+    An entry for exactly that chip wins; else the entry with no chip.
+    """
+    anyone = None
+    for fw in cfg["firmware"]:
+        if fw.get("id") != fid: continue
+        if chip and fw.get("chip") == chip: return fw
+        if not fw.get("chip"): anyone = fw
+    return anyone
 
 
 def save_config(cfg):
@@ -267,8 +295,8 @@ def fetch_version(dev):
     """
     Ask a device for its firmware info over HTTP.
 
-    Returns (fw_id, build, md5, error_text). On any failure fw_id/build/md5 are None
-    and error_text explains why (shown in the Detail column).
+    Returns (fw_id, build, md5, chip, error_text). On any failure fw_id/build/md5/chip
+    are None and error_text explains why (shown in the Detail column).
     """
     port = dev.get("port") or 80
     path = dev.get("version_path") or "/version"
@@ -279,14 +307,15 @@ def fetch_version(dev):
         with request.urlopen(url, timeout=HTTP_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", "replace").strip()
     except (error.URLError, OSError, ValueError) as exc:
-        return None, None, None, "no answer (%s)" % getattr(exc, "reason", exc)
+        return None, None, None, None, "no answer (%s)" % getattr(exc, "reason", exc)
 
     # Preferred format: JSON object with "id" and "build".
     try:
         obj = json.loads(body)
         if isinstance(obj, dict) and obj.get("id"):
             md5 = str(obj.get("md5") or "").strip().lower()
-            return str(obj["id"]), str(obj.get("build", "")), md5, ""
+            chip = str(obj.get("chip") or "").strip().lower()
+            return str(obj["id"]), str(obj.get("build", "")), md5, chip, ""
     except ValueError:
         pass
 
@@ -294,10 +323,12 @@ def fetch_version(dev):
     m_id = re.search(r'"?id"?\s*[:=]\s*"?([\w.\-]+)', body)
     m_bd = re.search(r'"?build"?\s*[:=]\s*"?(\d+)', body)
     m_md = re.search(r'"?md5"?\s*[:=]\s*"?([0-9a-fA-F]{32})', body)
+    m_ch = re.search(r'"?chip"?\s*[:=]\s*"?([\w\-]+)', body)
     if m_id:
         return (m_id.group(1), (m_bd.group(1) if m_bd else ""),
-                (m_md.group(1).lower() if m_md else ""), "")
-    return None, None, None, "unrecognized reply"
+                (m_md.group(1).lower() if m_md else ""),
+                (m_ch.group(1).lower() if m_ch else ""), "")
+    return None, None, None, None, "unrecognized reply"
 
 
 def send_to_device(dev, mode, port, path, text):
@@ -512,12 +543,13 @@ class FormDialog(tk.Toplevel):
 class App(tk.Tk):
     """Main window: devices tab, firmware tab, log pane."""
 
-    DEV_COLS = ("name", "host", "fw_id", "build", "md5", "target", "status", "detail")
-    FW_COLS = ("id", "file", "build", "md5", "cmd")
+    DEV_COLS = ("name", "host", "fw_id", "chip", "build", "md5", "status", "detail")
+    FW_COLS = ("id", "chip", "file", "build", "md5", "cmd")
+    CHIPS = ("esp8266", "esp32", "esp32s2", "esp32s3", "esp32c3", "esp32c6")
 
     def __init__(self):
         super().__init__()
-        self.title("Firmware Manager")
+        self.title("Firmware Manager " + VERSION)
 
         self.cfg = load_config()
         self.geometry(self.cfg.get("ui", {}).get("geometry") or "1100x640")
@@ -558,6 +590,7 @@ class App(tk.Tk):
                           ("Check", self.check_selected),
                           ("Update", self.update_selected),
                           ("Update all outdated", self.update_all_outdated),
+                          ("Install firmware...", self.install_fw),
                           ("Link binary", self.link_selected),
                           ("Enable/Disable", self.toggle_disabled),
                           ("|", None),
@@ -571,9 +604,8 @@ class App(tk.Tk):
 
         self.dev_tree = self._make_tree(
             dev_tab, self.DEV_COLS,
-            ("Name", "Host", "Reported FW", "Build", "Reported MD5", "Target FW",
-             "Status", "Detail"),
-            (140, 130, 160, 130, 250, 160, 140, 260), "dev", self._dev_menu)
+            ("Name", "Host", "Firmware", "Chip", "Build", "MD5", "Status", "Detail"),
+            (140, 130, 160, 80, 130, 250, 140, 260), "dev", self._dev_menu)
         # Remove EVERY state mapping that touches "selected" (and the Tk 8.6.9
         # "!selected" bug entries) from the Treeview colors. Result: row tag
         # colors always win, so the native blue selection never hides the
@@ -640,9 +672,9 @@ class App(tk.Tk):
 
         self.fw_tree = self._make_tree(
             fw_tab, self.FW_COLS,
-            ("Firmware ID", "Binary file", "Build (manual/auto)", "File MD5",
+            ("Firmware ID", "Chip", "Binary file", "Build (manual/auto)", "File MD5",
              "Upload command (id)"),
-            (180, 320, 140, 250, 340), "fw")
+            (180, 80, 320, 140, 250, 340), "fw")
         self.fw_tree.bind("<Double-1>", lambda e: self.edit_fw())
 
         # ---- Log pane ----
@@ -677,6 +709,7 @@ class App(tk.Tk):
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="Check", command=self.check_selected)
         self.menu.add_command(label="Update", command=self.update_selected)
+        self.menu.add_command(label="Install firmware...", command=self.install_fw)
         self.menu.add_command(label="Link binary", command=self.link_selected)
         self.menu.add_command(label="Enable/Disable", command=self.toggle_disabled)
         self.menu.add_separator()
@@ -701,6 +734,7 @@ class App(tk.Tk):
                            ("Check", self.check_selected),
                            ("Update", self.update_selected),
                            ("Update all outdated", self.update_all_outdated),
+                           ("Install firmware...", self.install_fw),
                            ("Link binary", self.link_selected),
                            ("Enable/Disable", self.toggle_disabled),
                            (None, None),
@@ -886,14 +920,14 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ refresh --
 
-    def _target_fw(self, dev):
-        """
-        Return (target_id, registry_entry) for a device.
-        Target = explicit 'target' field, else the firmware id it reports.
-        """
-        st = self.state.get(dev["name"], {})
-        tid = dev.get("target") or st.get("fw_id") or ""
-        return tid, self.cfg["firmware"].get(tid)
+    def _device_fw(self, dev):
+        """Return (reported_id, registry_entry) for a device (entry matches id and chip)."""
+        fid = self.state.get(dev["name"], {}).get("fw_id") or ""
+        return fid, find_fw(self.cfg, fid, self._chip(dev))
+
+    def _chip(self, dev):
+        """Chip of a device: explicit 'chip' field, else the one it reports."""
+        return dev.get("chip") or self.state.get(dev["name"], {}).get("chip") or ""
 
     def _refresh_devices(self):
         """Rebuild the device tree from config + runtime state."""
@@ -901,16 +935,15 @@ class App(tk.Tk):
         self.dev_tree.delete(*self.dev_tree.get_children())
         for dev in self.cfg["devices"]:
             st = self.state.get(dev["name"], {})
-            tid, _ = self._target_fw(dev)
             status = st.get("status", "?")
             if dev.get("disabled"): status = ST_DISABLED
             if dev["name"] in self.busy: status = ST_BUSY
             self.dev_tree.insert(
                 "", "end", iid=dev["name"],
                 values=(dev["name"], dev["host"],
-                        st.get("fw_id") or "unknown", st.get("build", ""),
-                        st.get("md5", ""),
-                        tid, status, st.get("detail", "")),
+                        st.get("fw_id") or "unknown", self._chip(dev),
+                        st.get("build", ""), st.get("md5", ""),
+                        status, st.get("detail", "")),
                 tags=(status,))
         # Restore selection where possible.
         keep = [s for s in sel if self.dev_tree.exists(s)]
@@ -934,12 +967,17 @@ class App(tk.Tk):
     def _refresh_firmware(self):
         """Rebuild the firmware registry tree."""
         self.fw_tree.delete(*self.fw_tree.get_children())
-        for fid, fw in sorted(self.cfg["firmware"].items()):
-            self.fw_tree.insert("", "end", iid=fid, values=(
-                fid, fw.get("file", ""),
+        for i, fw in sorted(enumerate(self.cfg["firmware"]),
+                            key=lambda p: (p[1].get("id", ""), p[1].get("chip", ""))):
+            self.fw_tree.insert("", "end", iid=str(i), values=(
+                fw.get("id", ""), fw.get("chip", ""), fw.get("file", ""),
                 fw.get("build") or local_build(fw) or "-",
                 file_md5(fw.get("file", "")) or "-",
                 fw.get("cmd", "")))
+
+    def _selected_fw(self):
+        """Return the list of selected registry entries."""
+        return [self.cfg["firmware"][int(i)] for i in self.fw_tree.selection()]
 
     def _selected_devices(self):
         """Return the list of selected device dicts."""
@@ -950,14 +988,16 @@ class App(tk.Tk):
 
     def _do_check(self, dev):
         """Worker body: query one device and store the resulting status."""
-        fid, build, md5, err = fetch_version(dev)
-        st = {"fw_id": fid, "build": build or "", "md5": md5 or "", "detail": err}
-        # Compare against the (possibly overridden) target firmware.
-        tid = dev.get("target") or fid or ""
-        fw = self.cfg["firmware"].get(tid)
+        fid, build, md5, chip, err = fetch_version(dev)
+        chip = dev.get("chip") or chip or ""
+        st = {"fw_id": fid, "build": build or "", "md5": md5 or "", "chip": chip,
+              "detail": err}
+        # Compare against the registry entry for the reported id and chip.
+        tid = fid or ""
+        fw = find_fw(self.cfg, tid, chip)
         st["status"] = compute_status(fid, build, fw, md5)
         if st["status"] == ST_NOBIN and not st["detail"]:
-            st["detail"] = "no binary linked for '%s'" % tid
+            st["detail"] = "no binary linked for '%s' (chip: %s)" % (tid, chip or "unknown")
         elif st["status"] == ST_UPD and fw:
             if md5 and build and build == local_build(fw):
                 st["detail"] = "same build, different binary (md5 differs)"
@@ -1069,20 +1109,23 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ updates --
 
-    def _install(self, dev):
+    def _install(self, dev, fw=None):
         """
         Worker body: run the upload command template for one device.
+        fw = registry entry to flash (default: the entry for the device's own firmware).
         Returns True when the upload command exited with code 0.
         """
-        tid, fw = self._target_fw(dev)
+        if fw: tid = fw["id"]
+        else: tid, fw = self._device_fw(dev)
         if not fw or not os.path.isfile(fw.get("file", "")):
-            self.say("%s: no binary linked for '%s'" % (dev["name"], tid))
+            self.say("%s: no binary linked for '%s' (chip: %s)"
+                     % (dev["name"], tid, self._chip(dev) or "unknown"))
             return False
         try:
             cmd = resolve_command(fw.get("cmd"), {
                 "host": dev["host"], "port": dev.get("port") or 80,
                 "name": dev["name"], "id": tid, "file": fw["file"],
-                "build": local_build(fw)})
+                "build": local_build(fw), "chip": self._chip(dev)})
         except (KeyError, ValueError) as exc:
             self.say("%s: bad placeholder in upload command: %s"
                      % (dev["name"], exc))
@@ -1105,15 +1148,18 @@ class App(tk.Tk):
         self.say("%s: upload command exited with code %s" % (dev["name"], code))
         return code == 0
 
-    def _run_updates(self, devs):
-        """Update devices one after another (re-check only when an upload failed)."""
+    def _run_updates(self, devs, fw=None):
+        """
+        Update devices one after another (re-check only when an upload failed).
+        fw = registry entry to flash on all of them (default: each device's own).
+        """
         for d in devs:
             self.busy.add(d["name"])
         self.ui(self._refresh_devices)
 
         def job():
             for d in devs:
-                ok = self._install(d)
+                ok = self._install(d, fw)
                 self.say("%s: update %s" % (d["name"], "finished" if ok else "FAILED"))
                 # No re-check after a successful upload; only after a failure.
                 if not ok:
@@ -1130,6 +1176,32 @@ class App(tk.Tk):
         names = ", ".join(d["name"] for d in devs)
         if messagebox.askyesno("Update", "Upload firmware to: %s ?" % names):
             self._run_updates(devs)
+
+    def install_fw(self):
+        """Pick a registry entry for the selected devices' chip and flash it."""
+        devs = [d for d in self._selected_devices() if d["name"] not in self.busy]
+        if not devs:
+            return
+        chips = {self._chip(d) for d in devs}
+        if len(chips) > 1:
+            messagebox.showerror("Install firmware", "Selected devices have different chips.")
+            return
+        chip = chips.pop()
+        opts = {"%s [%s]" % (f["id"], f.get("chip") or "any"): f
+                for f in self.cfg["firmware"] if not f.get("chip") or f["chip"] == chip}
+        if not opts:
+            messagebox.showinfo("Install firmware", "No firmware in the registry for chip '%s'."
+                                " Set the device chip via Edit if it reports none." % (chip or "unknown"))
+            return
+        dlg = FormDialog(self, "Install firmware", [("fw", "Firmware", sorted(opts))])
+        fw = opts.get(dlg.result["fw"]) if dlg.result else None
+        if not fw:
+            return
+        lines = "\n".join("%s (%s)" % (d["name"], self.state.get(d["name"], {}).get("fw_id") or "unknown")
+                          for d in devs)
+        if messagebox.askyesno("Install firmware", "Flash %s [%s] onto:\n%s ?"
+                               % (fw["id"], fw.get("chip") or "any", lines)):
+            self._run_updates(devs, fw)
 
     def update_all_outdated(self):
         """Update every device whose status is UPDATE AVAILABLE."""
@@ -1151,7 +1223,7 @@ class App(tk.Tk):
         return [("name", "Name", "text"), ("host", "Host / IP", "text"),
                 ("port", "Port (default 80)", "text"),
                 ("version_path", "Version path (default /version)", "text"),
-                ("target", "Target FW id (empty = same as reported)", "text"),
+                ("chip", "Chip (empty = as reported)", list(self.CHIPS)),
                 ("cmd_path", "Command path (default /cmd?q=)", "text")]
 
     def add_device(self):
@@ -1216,19 +1288,29 @@ class App(tk.Tk):
     @property
     def FW_FIELDS(self):
         """Firmware form fields; the command dropdown lists every command id."""
-        return [("id", "Firmware id", "text"), ("file", "Binary file", "file"),
+        return [("id", "Firmware id", "text"),
+                ("chip", "Chip (empty = any)", list(self.CHIPS)),
+                ("file", "Binary file", "file"),
                 ("build", "Build (empty = auto)", "text"),
                 ("cmd", "Upload command id", sorted(load_props()[1]))]
 
-    def _store_fw(self, res, old_id=None):
-        """Save a firmware form result, handling renames."""
+    def _store_fw(self, res, old=None):
+        """Save a firmware form result (old = registry entry being edited)."""
         if not res or not res["id"]:
             return
-        if old_id and old_id != res["id"]:
-            self.cfg["firmware"].pop(old_id, None)
+        # One entry per firmware id and chip; refuse duplicates.
+        if any(f["id"] == res["id"] and f.get("chip", "") == res["chip"] and f is not old
+               for f in self.cfg["firmware"]):
+            messagebox.showerror("Error", "Entry for this id and chip already exists.")
+            return
         # Pre-fill the default command so it is visible/editable later.
         res["cmd"] = res["cmd"] or DEFAULT_CMD
-        self.cfg["firmware"][res["id"]] = {k: res[k] for k in ("file", "build", "cmd")}
+        entry = {k: res[k] for k in ("id", "chip", "file", "build", "cmd")}
+        if old is None:
+            self.cfg["firmware"].append(entry)
+        else:
+            old.clear()
+            old.update(entry)
         save_config(self.cfg)
         self._refresh_firmware()
         # Statuses may change now that a binary is linked.
@@ -1236,43 +1318,42 @@ class App(tk.Tk):
 
     def add_fw(self):
         """Add a registry entry (form pre-filled from the selected entry)."""
-        sel = self.fw_tree.selection()
-        vals = dict(self.cfg["firmware"][sel[0]], id=sel[0]) if sel else {"cmd": DEFAULT_CMD}
+        sel = self._selected_fw()
+        vals = dict(sel[0]) if sel else {"cmd": DEFAULT_CMD}
         dlg = FormDialog(self, "Add firmware", self.FW_FIELDS, vals)
         self._store_fw(dlg.result)
 
     def edit_fw(self):
         """Edit the selected registry entry."""
-        sel = self.fw_tree.selection()
+        sel = self._selected_fw()
         if not sel:
             return
-        vals = dict(self.cfg["firmware"][sel[0]], id=sel[0])
-        dlg = FormDialog(self, "Edit firmware", self.FW_FIELDS, vals)
+        dlg = FormDialog(self, "Edit firmware", self.FW_FIELDS, dict(sel[0]))
         self._store_fw(dlg.result, sel[0])
 
     def remove_fw(self):
         """Remove the selected registry entries."""
-        sel = self.fw_tree.selection()
+        sel = self._selected_fw()
         if sel and messagebox.askyesno("Remove", "Remove %d entr(y/ies)?" % len(sel)):
-            for fid in sel:
-                self.cfg["firmware"].pop(fid, None)
+            gone = {id(f) for f in sel}
+            self.cfg["firmware"][:] = [f for f in self.cfg["firmware"] if id(f) not in gone]
             save_config(self.cfg)
             self._refresh_firmware()
             self.scan_all()
 
     def link_selected(self):
-        """Create/edit the registry entry for the selected device's target FW."""
+        """Create/edit the registry entry for the selected device's firmware."""
         sel = self._selected_devices()
         if not sel:
             return
-        tid, fw = self._target_fw(sel[0])
+        tid, fw = self._device_fw(sel[0])
         if not tid:
-            messagebox.showinfo("Link", "Device FW id unknown. Set a Target FW id "
-                                        "via Edit, or add it in the Firmware tab.")
+            messagebox.showinfo("Link", "Device FW id unknown. Add the firmware "
+                                        "in the Firmware tab instead.")
             return
-        vals = dict(fw or {"cmd": DEFAULT_CMD}, id=tid)
+        vals = dict(fw or {"cmd": DEFAULT_CMD, "chip": self._chip(sel[0])}, id=tid)
         dlg = FormDialog(self, "Link binary for %s" % tid, self.FW_FIELDS, vals)
-        self._store_fw(dlg.result, tid)
+        self._store_fw(dlg.result, fw)
 
 
 if __name__ == "__main__":
