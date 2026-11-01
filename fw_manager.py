@@ -105,7 +105,7 @@ from fw_manager_theme import (
 # --------------------------------------------------------------------------- #
 
 # Shown in the window title.
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Config file lives next to the script so the tool is portable.
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -321,6 +321,64 @@ def resolve_command(value, builtins):
     """
     variables, cmds = load_props()
     return expand(cmds.get(value or DEFAULT_CMD, value), builtins, variables)
+
+
+# Tk maximizes with "wm state zoomed" on Windows and macOS, and with the
+# "-zoomed" attribute on X11 (Linux, BSD).
+_ZOOM_ATTR = sys.platform not in ("win32", "darwin")
+
+
+def _zoomed(win):
+    """@return  True if the window is maximized (False if unknown)."""
+    try:
+        if _ZOOM_ATTR:
+            return bool(win.wm_attributes("-zoomed"))
+        return win.wm_state() == "zoomed"
+    except tk.TclError:
+        return False
+
+
+def _set_zoomed(win, zoomed):
+    """Maximize or restore a window; does nothing if the window manager refuses."""
+    try:
+        if _ZOOM_ATTR:
+            win.wm_attributes("-zoomed", zoomed)
+        else:
+            win.wm_state("zoomed" if zoomed else "normal")
+    except tk.TclError:
+        pass
+
+
+def save_window_state(win):
+    """
+    Size, position and maximized state of a window, for the config. Works the
+    same on every platform; the window is restored first so the saved
+    geometry is the normal (not the maximized) one.
+
+    @param win  Tk toplevel
+    @return     {"geometry": "WxH+X+Y", "zoomed": bool}
+    """
+    zoomed = _zoomed(win)
+    if zoomed:
+        _set_zoomed(win, False)
+        win.update()
+    state = {"geometry": win.geometry(), "zoomed": zoomed}
+    if zoomed:
+        _set_zoomed(win, True)
+    return state
+
+
+def restore_window_state(win, state, default_geometry):
+    """
+    Apply what save_window_state returned. Works the same on every platform.
+
+    @param win               Tk toplevel
+    @param state             saved dict (may be empty or incomplete)
+    @param default_geometry  geometry used when none is saved
+    """
+    win.geometry(state.get("geometry") or default_geometry)
+    if state.get("zoomed"):
+        _set_zoomed(win, True)
 
 
 def open_path(path):
@@ -609,7 +667,7 @@ class App(tk.Tk):
                 pass
         # Selected theme = theme/<code>.json; the code in use is kept in the config.
         self.cfg["theme"] = set_theme(self.cfg.get("theme"))
-        self.geometry(self.cfg.get("ui", {}).get("geometry") or "1100x640")
+        restore_window_state(self, self.cfg.get("ui", {}), "1100x640")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Runtime (non-persisted) state per device name:
         # {"fw_id", "build", "status", "detail"}
@@ -1012,14 +1070,8 @@ class App(tk.Tk):
     # ------------------------------------------------------------ UI state --
 
     def _restore_ui(self):
-        """Restore maximized state and log pane height."""
+        """Restore the log pane height."""
         ui = self.cfg.get("ui", {})
-        if ui.get("zoomed"):
-            try:
-                # wm_state, not state: App.state is the per-device status dict.
-                self.wm_state("zoomed")
-            except tk.TclError:
-                pass
 
         def sash():
             h = self.paned.winfo_height()
@@ -1031,13 +1083,8 @@ class App(tk.Tk):
     def _on_close(self):
         """Save the UI state, then quit."""
         try:
-            zoomed = self.wm_state() == "zoomed"
-            if zoomed:
-                self.wm_state("normal")   # so geometry() is the normal size
-                self.update_idletasks()
             ui = self.cfg.setdefault("ui", {})
-            ui["geometry"] = self.geometry()
-            ui["zoomed"] = zoomed
+            ui.update(save_window_state(self))
             ui["log_h"] = self.paned.winfo_height() - self.paned.sashpos(0)
             ui["widths"] = {
                 key: {c: int(t.column(c, "width")) for c in t["columns"]}
