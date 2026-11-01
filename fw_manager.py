@@ -54,13 +54,18 @@ Columns: right click a column header to show/hide columns (saved in the config).
 UI state: window geometry, maximized state, log pane height and
 column widths are saved to the config ("ui" key) on exit and restored on start.
 
-Colors: every color the program uses is in the config under "colors", in four
-groups: "log" (log line text), "status" (device row background per status),
-"table" (device row text) and "selection" (selected firmware row). Values are
-#rrggbb or a Tk color name. The code is in fw_manager_colors.py and the dialog
-descriptions are in lang/<code>.json (see fw_manager_lang.py; Language menu). Edit them with Settings > Colors... or by hand while
-the program is closed; they are used the next time the program starts. A
-missing or invalid entry falls back to the built-in default.
+Themes: every color the program uses is in a theme file, theme/<code>.json next
+to this script (os_dark.json = system widgets with the program's own colors,
+dark.json = everything dark). The selected
+theme code is saved in the config as "theme" (Settings > Theme > pick one; used
+from the next start). A theme file holds the palette of the window and widgets
+and the colors of the log lines ("log"), the device rows ("status"), the row
+text ("table") and the selected firmware row ("selection"). Values are
+#rrggbb or a Tk color name; an empty value leaves that part to the system. Edit
+every value of every theme with Settings > Theme > Edit theme... or by hand in
+the file while the program is closed. The code is in fw_manager_theme.py and
+the dialog descriptions are in lang/<code>.json (see fw_manager_lang.py;
+Language menu).
 
 Build number of a binary (first match wins):
   1. manual "build" field in the registry entry
@@ -88,11 +93,12 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
 
-from fw_manager_colors import (
-    ST_OK, ST_UPD, ST_NEWER, ST_NOBIN, ST_UNKNOWN, ST_BUSY, ST_DISABLED,
-    ST_UNCHECKED, STATUS_TEXT, STATUS_ID, DEFAULT_COLORS, ColorsDialog,
-    seed_colors, resolve_color, current_colors, refresh_status_text)
 from fw_manager_lang import t, list_languages, resolve_language, set_language
+from fw_manager_theme import (
+    ST_OK, ST_UPD, ST_NEWER, ST_NOBIN, ST_UNKNOWN, ST_BUSY, ST_DISABLED,
+    ST_UNCHECKED, STATUS_TEXT, STATUS_ID, STATUS_IDS, LOG_KINDS, ThemeDialog,
+    apply_theme, drop_legacy_colors, list_themes, refresh_status_text,
+    resolve_color, resolve_theme, set_theme)
 
 # --------------------------------------------------------------------------- #
 # Constants / persistence
@@ -595,11 +601,14 @@ class App(tk.Tk):
         self.cfg["language"] = set_language(self.cfg.get("language"))
         refresh_status_text()
         self.title(t("app.title", version=VERSION))
-        if seed_colors(self.cfg):
+        # Colors live only in the theme files now: drop the old config keys.
+        if drop_legacy_colors(self.cfg):
             try:
-                save_config(self.cfg)    # so the colors show up in the file
+                save_config(self.cfg)
             except OSError:
                 pass
+        # Selected theme = theme/<code>.json; the code in use is kept in the config.
+        self.cfg["theme"] = set_theme(self.cfg.get("theme"))
         self.geometry(self.cfg.get("ui", {}).get("geometry") or "1100x640")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Runtime (non-persisted) state per device name:
@@ -609,6 +618,10 @@ class App(tk.Tk):
         self.busy = set()
         # Worker threads push callables here; main thread executes them.
         self.q = queue.Queue()
+
+        # Draw with the selected theme. Must run BEFORE any widget is created
+        # (the Tk option database is only read when a widget is created).
+        apply_theme(self)
 
         self._build_ui()
         self._build_menubar()
@@ -671,20 +684,22 @@ class App(tk.Tk):
                   background=_strip_selected("background"))
         self.dev_tree.configure(style="Dev.Treeview")
         # Every other tree (firmware registry) shows a clear blue selection.
+        sel_fg = self._color("selection", "text")
+        sel_bg = self._color("selection", "background")
         style.map("Treeview",
                   foreground=_strip_selected("foreground")
-                  + [("selected", self._color("selection", "text"))],
+                  + ([("selected", sel_fg)] if sel_fg else []),
                   background=_strip_selected("background")
-                  + [("selected", self._color("selection", "background"))])
+                  + ([("selected", sel_bg)] if sel_bg else []))
 
         # Bold + underlined font used for selected rows.
         self.sel_font = tkfont.nametofont("TkDefaultFont").copy()
         self.sel_font.configure(weight="bold", underline=True)
         TEXT_FG = self._color("table", "text")
         OFF_FG = self._color("table", "disabled_text")
-        # Row background per status (colors come from the config).
+        # Row background per status (colors come from the selected theme).
         status_colors = {tag: self._color("status", tag)
-                         for tag in DEFAULT_COLORS["status"]}
+                         for tag in STATUS_IDS}
         for tag, color in status_colors.items():
             fg = OFF_FG if tag == ST_DISABLED else TEXT_FG
             self.dev_tree.tag_configure(tag, background=color, foreground=fg)
@@ -820,7 +835,7 @@ class App(tk.Tk):
         bar.add_cascade(label=t("menu.firmware"), menu=m)
 
         m = tk.Menu(bar, tearoff=0)
-        m.add_command(label=t("menu.colors"), command=self.edit_colors)
+        m.add_cascade(label=t("menu.theme"), menu=self._build_theme_menu(m))
         m.add_separator()
         m.add_command(label=t("menu.open_props"), command=self.open_props)
         m.add_command(label=t("menu.show_props"), command=self.show_props)
@@ -848,37 +863,66 @@ class App(tk.Tk):
 
     def _color(self, group, name):
         """
-        Configured color if Tk accepts it, else the built-in default.
+        Color of the selected theme if Tk accepts it.
 
         @param group  color group, e.g. "status"
         @param name   color name inside the group
-        @return       color string usable by Tk
+        @return       color string usable by Tk, or "" if the theme leaves it empty
+                      (Tk / the system then decides)
         """
-        return resolve_color(self, self.cfg, group, name)
+        return resolve_color(self, group, name)
 
     def _apply_log_colors(self):
         """
         Set the text color of each log line kind (called once at startup).
-        Colors come from the "log" group of the config.
+        Colors come from the "log" group of the selected theme.
         """
-        for name in DEFAULT_COLORS["log"]:
+        for name in LOG_KINDS:
             self.log.tag_configure(name, foreground=self._color("log", name))
 
-    def edit_colors(self):
+    def _build_theme_menu(self, parent):
         """
-        Settings > Colors...: edit the colors and save them to the config.
-        The new colors are used the next time the program starts.
+        Create the Settings > Theme menu: one radio item per file in theme/,
+        then Edit theme...
+
+        @param parent  menu that will hold the submenu
+        @return        the new submenu
         """
-        dlg = ColorsDialog(self, current_colors(self.cfg))
-        if dlg.result is None:
-            return
-        self.cfg["colors"] = dlg.result
+        sub = tk.Menu(parent, tearoff=0)
+        self.theme_var = tk.StringVar(value=self.cfg.get("theme", ""))
+        for code, name in list_themes():
+            sub.add_radiobutton(label=name, value=code, variable=self.theme_var,
+                                command=lambda c=code: self.select_theme(c))
+        sub.add_separator()
+        sub.add_command(label=t("menu.theme_edit"), command=self.edit_theme)
+        return sub
+
+    def select_theme(self, code):
+        """
+        Settings > Theme > <name>: save the choice to the config. The theme is
+        used the next time the program starts.
+
+        @param code  theme code, e.g. "os_dark"
+        """
+        self.cfg["theme"] = resolve_theme(code)
+        self.theme_var.set(self.cfg["theme"])
         try:
             save_config(self.cfg)
         except OSError as exc:
-            messagebox.showerror(t("dlg.colors"), t("msg.save_failed", error=exc))
+            messagebox.showerror(t("dlg.theme"), t("msg.save_failed", error=exc))
             return
-        messagebox.showinfo(t("dlg.colors"), t("msg.colors_saved"))
+        self.say(t("msg.theme_saved"), "warn")
+
+    def edit_theme(self):
+        """
+        Settings > Theme > Edit theme...: edit every value of a theme file (the
+        dialog writes the file itself). The new values are used the next time
+        the program starts.
+        """
+        dlg = ThemeDialog(self, self.cfg.get("theme", ""))
+        if dlg.result is None:
+            return
+        messagebox.showinfo(t("dlg.theme"), t("msg.theme_saved"))
 
     def _make_tree(self, parent, cols, heads, widths, key, row_menu=None):
         """
@@ -1021,7 +1065,7 @@ class App(tk.Tk):
     def say(self, text, tag=None):
         """
         Append a timestamped line to the log pane (thread safe).
-        tag = one of the DEFAULT_COLORS["log"] names to color the line (None = default).
+        tag = one of the LOG_KINDS names to color the line (None = default).
         """
         stamp = datetime.now().strftime("%H:%M:%S")
 

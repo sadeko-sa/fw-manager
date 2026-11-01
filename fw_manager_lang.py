@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fw_manager_lang.py - Program text for fw_manager.py and fw_manager_colors.py.
+fw_manager_lang.py - Program text for fw_manager.py and fw_manager_theme.py.
 
 All text the user sees (menus, buttons, column headings, dialogs, log lines,
 status texts, color descriptions) lives in lang/<code>.json next to this script.

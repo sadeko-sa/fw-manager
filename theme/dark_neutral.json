@@ -1,0 +1,42 @@
+{
+  "theme_name": "Dark Neutral",
+  "ttk_theme": "clam",
+  "palette": {
+    "bg": "#2b2b2b",
+    "surface": "#3c3f41",
+    "surface_hi": "#4a4d4f",
+    "surface_press": "#585b5d",
+    "field": "#232323",
+    "fg": "#d0d0d0",
+    "fg_disabled": "#808080",
+    "border": "#555555",
+    "select_bg": "#4b6eaf",
+    "select_fg": "#ffffff",
+    "thumb": "#5a5a5a"
+  },
+  "log": {
+    "err": "#e06c6c",
+    "warn": "#e0b050",
+    "ok": "#7fc98f",
+    "info": "#7fb0e0",
+    "dim": "#909090"
+  },
+  "status": {
+    "up_to_date": "#2f5d3a",
+    "update_available": "#6e5f2a",
+    "newer_on_device": "#4f6234",
+    "no_binary_linked": "#703a3a",
+    "unknown_fw": "#703a3a",
+    "working": "#54456e",
+    "disabled": "#2f2f2f",
+    "unchecked": "#3c3f41"
+  },
+  "table": {
+    "text": "#d0d0d0",
+    "disabled_text": "#808080"
+  },
+  "selection": {
+    "text": "#ffffff",
+    "background": "#4b6eaf"
+  }
+}

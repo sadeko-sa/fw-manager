@@ -1,0 +1,42 @@
+{
+  "theme_name": "Dark Dracula",
+  "ttk_theme": "clam",
+  "palette": {
+    "bg": "#282a36",
+    "surface": "#343746",
+    "surface_hi": "#44475a",
+    "surface_press": "#565a73",
+    "field": "#21222c",
+    "fg": "#f8f8f2",
+    "fg_disabled": "#6272a4",
+    "border": "#44475a",
+    "select_bg": "#44475a",
+    "select_fg": "#f8f8f2",
+    "thumb": "#6272a4"
+  },
+  "log": {
+    "err": "#ff5555",
+    "warn": "#ffb86c",
+    "ok": "#50fa7b",
+    "info": "#8be9fd",
+    "dim": "#6272a4"
+  },
+  "status": {
+    "up_to_date": "#1f5c3a",
+    "update_available": "#6b5f2a",
+    "newer_on_device": "#3f5f3a",
+    "no_binary_linked": "#6e2b3a",
+    "unknown_fw": "#6e2b3a",
+    "working": "#4b3a78",
+    "disabled": "#21222c",
+    "unchecked": "#343746"
+  },
+  "table": {
+    "text": "#f8f8f2",
+    "disabled_text": "#6272a4"
+  },
+  "selection": {
+    "text": "#f8f8f2",
+    "background": "#6c4fa8"
+  }
+}

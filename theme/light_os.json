@@ -1,0 +1,42 @@
+{
+  "theme_name": "Light OS",
+  "ttk_theme": "",
+  "palette": {
+    "bg": "",
+    "surface": "",
+    "surface_hi": "",
+    "surface_press": "",
+    "field": "",
+    "fg": "",
+    "fg_disabled": "",
+    "border": "",
+    "select_bg": "",
+    "select_fg": "",
+    "thumb": ""
+  },
+  "log": {
+    "err": "#b3261e",
+    "warn": "#9a5b00",
+    "ok": "#1b7a3a",
+    "info": "#0b5cad",
+    "dim": "#6b7280"
+  },
+  "status": {
+    "up_to_date": "#b7e4c7",
+    "update_available": "#fff0a8",
+    "newer_on_device": "#d8eab0",
+    "no_binary_linked": "#f5b5b5",
+    "unknown_fw": "#f5b5b5",
+    "working": "#d9c8f2",
+    "disabled": "#e0e0e0",
+    "unchecked": "#f0f0f0"
+  },
+  "table": {
+    "text": "#1a1a1a",
+    "disabled_text": "#8a8a8a"
+  },
+  "selection": {
+    "text": "#ffffff",
+    "background": "#0a64ad"
+  }
+}
