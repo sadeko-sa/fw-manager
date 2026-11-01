@@ -40,6 +40,7 @@ import os
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox, colorchooser
+import tkinter.font as tkfont
 
 from fw_manager_lang import t
 
@@ -615,6 +616,14 @@ class ThemeDialog(tk.Toplevel):
         ttk.Button(btns, text=t("btn.cancel"), command=self.destroy).pack(side="right")
         ttk.Button(btns, text=t("btn.ok"), command=self._ok).pack(side="right", padx=3)
 
+        # Live preview on the left, drawn with classic widgets and the colors
+        # currently typed in the entries (nothing is applied to the program).
+        self._pv = []                 # (widget, {option: color spec}) to recolor
+        self._pv_logtext = None
+        left = ttk.Frame(frm)
+        left.pack(side="left", fill="y", padx=(0, 10))
+        self._build_preview(left)
+
         # Header: theme file, display name, ttk theme.
         head = ttk.Frame(frm)
         head.pack(side="top", fill="x", pady=(0, 8))
@@ -683,6 +692,126 @@ class ThemeDialog(tk.Toplevel):
         self.grab_set()
         self.wait_window(self)
 
+    def _pcolor(self, spec):
+        """
+        Color for the preview: the entry value if Tk accepts it, else a system
+        like fallback.
+
+        @param spec  "<group>.<name>", e.g. "palette.bg"
+        @return      a color string usable by Tk
+        """
+        group, name = spec.split(".", 1)
+        value = self.vars[(group, name)].get().strip() if (group, name) in self.vars else ""
+        if value and self._valid(value):
+            return value
+        if group == "status":
+            return self._pcolor("palette.field")
+        if spec == "table.text" or group == "log":
+            return self._pcolor("palette.fg")
+        if spec == "table.disabled_text":
+            return self._pcolor("palette.fg_disabled")
+        if spec == "selection.text":
+            return self._pcolor("palette.select_fg")
+        if spec == "selection.background":
+            return self._pcolor("palette.select_bg")
+        style = ttk.Style(self)
+        return {
+            "palette.bg": self.plain, "palette.surface": self.plain,
+            "palette.surface_hi": self.plain, "palette.surface_press": self.plain,
+            "palette.field": style.lookup("TEntry", "fieldbackground") or "white",
+            "palette.fg": style.lookup("TLabel", "foreground") or "black",
+            "palette.fg_disabled": "gray50", "palette.border": "gray50",
+            "palette.select_bg": "#3399ff", "palette.select_fg": "white",
+            "palette.thumb": "gray60",
+        }[spec]
+
+    def _pv_add(self, widget, **opts):
+        """
+        Register a preview widget and color it.
+
+        @param widget  the widget
+        @param opts    option -> color spec (see _pcolor)
+        @return        the widget
+        """
+        self._pv.append((widget, opts))
+        return widget
+
+    def _build_preview(self, parent):
+        """
+        Build the preview: tabs, buttons, input field, scrollbar, one device
+        row per status, the firmware table selection and the log lines.
+
+        @param parent  frame on the left side of the dialog
+        """
+        add = self._pv_add
+        font = tkfont.nametofont("TkDefaultFont")
+        root = add(tk.Frame(parent, bd=1, relief="solid", padx=8, pady=8),
+                   background="palette.bg", highlightbackground="palette.border")
+        root.pack(fill="y", expand=True)
+
+        tabs = add(tk.Frame(root), background="palette.bg")
+        tabs.pack(fill="x")
+        for text, bg in ((t("tab.devices"), "palette.bg"), (t("tab.firmware"), "palette.surface")):
+            add(tk.Label(tabs, text=text, padx=10, pady=3, font=font),
+                background=bg, foreground="palette.fg").pack(side="left", padx=(0, 2))
+
+        row = add(tk.Frame(root), background="palette.bg")
+        row.pack(fill="x", pady=(8, 0))
+        for text, bg, fg in ((t("btn.check"), "palette.surface", "palette.fg"),
+                             (t("btn.update"), "palette.surface_hi", "palette.fg"),
+                             (t("btn.edit"), "palette.surface_press", "palette.fg"),
+                             (t("btn.remove"), "palette.bg", "palette.fg_disabled")):
+            add(tk.Label(row, text=text, padx=8, pady=2, font=font, bd=0,
+                         highlightthickness=1),
+                background=bg, foreground=fg,
+                highlightbackground="palette.border").pack(side="left", padx=(0, 4))
+
+        entry = add(tk.Entry(root, font=font, highlightthickness=1, bd=0, width=24),
+                    background="palette.field", foreground="palette.fg",
+                    insertbackground="palette.fg",
+                    selectbackground="palette.select_bg",
+                    selectforeground="palette.select_fg",
+                    highlightbackground="palette.border")
+        entry.insert(0, "esp-195155.local")
+        entry.select_range(0, 3)
+        entry.pack(fill="x", pady=(8, 0))
+
+        trough = add(tk.Frame(root, height=10), background="palette.field")
+        trough.pack(fill="x", pady=(6, 0))
+        trough.pack_propagate(False)
+        add(tk.Frame(trough, width=70), background="palette.thumb").pack(side="left", fill="y")
+
+        mono = tkfont.nametofont("TkFixedFont")
+        for sid in STATUS_IDS:
+            disabled = sid == ST_DISABLED
+            add(tk.Label(root, text=STATUS_TEXT[sid], anchor="w", padx=6, font=mono),
+                background="status." + sid,
+                foreground="table.disabled_text" if disabled else "table.text"
+                ).pack(fill="x", pady=(8 if sid == STATUS_IDS[0] else 0, 0))
+
+        add(tk.Label(root, text="LED_WS2811.ino", anchor="w", padx=6, font=mono),
+            background="selection.background", foreground="selection.text"
+            ).pack(fill="x", pady=(8, 0))
+
+        log = add(tk.Text(root, height=len(LOG_KINDS), width=30, bd=0,
+                          highlightthickness=0, font=mono, cursor="arrow"),
+                  background="palette.field", foreground="palette.fg")
+        for kind in LOG_KINDS:
+            log.insert("end", color_label("log", kind) + "\n", kind)
+        log.configure(state="disabled")
+        log.pack(fill="x", pady=(8, 0))
+        self._pv_logtext = log
+
+    def _pv_update(self):
+        """Recolor the preview from the colors currently in the entries."""
+        if not getattr(self, "_pv", None):
+            return
+        for widget, opts in self._pv:
+            widget.configure(**{opt: self._pcolor(spec) for opt, spec in opts.items()})
+        if self._pv_logtext is not None:
+            for kind in LOG_KINDS:
+                self._pv_logtext.tag_configure(kind, foreground=self._pcolor("log." + kind))
+
     def _wheel(self, event):
         """
         Scroll the list with the mouse wheel.
@@ -737,6 +866,7 @@ class ThemeDialog(tk.Toplevel):
             self.swatches[key].configure(background=color, text="")
         else:
             self.swatches[key].configure(background=self.plain, text=t("val.invalid"))
+        self._pv_update()
 
     def _pick(self, group, name):
         """
@@ -775,6 +905,7 @@ class ThemeDialog(tk.Toplevel):
         for (group, name), var in self.vars.items():
             var.set(data[group][name])
         self.snapshot = self._collect()
+        self._pv_update()
 
     def _dirty(self):
         """

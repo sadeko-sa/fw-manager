@@ -922,7 +922,7 @@ class App(tk.Tk):
         dlg = ThemeDialog(self, self.cfg.get("theme", ""))
         if dlg.result is None:
             return
-        messagebox.showinfo(t("dlg.theme"), t("msg.theme_saved"))
+        self.say(t("msg.theme_saved"), "warn")
 
     def _make_tree(self, parent, cols, heads, widths, key, row_menu=None):
         """
