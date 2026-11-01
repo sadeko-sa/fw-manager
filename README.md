@@ -32,7 +32,7 @@ Send messages to a device over HTTP or TCP and get the response in the log:
 
 | Platform | Status |
 | --- | --- |
-| PC | OK |
+| Windows | OK |
 | Linux | Should be OK, not tested |
 | Android | Limited: mDNS (`.local` host names) may not work if the OS does not support it, so use IP addresses; the UI is too big for the screen |
 
