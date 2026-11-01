@@ -4,11 +4,11 @@ A small desktop tool (Python + Tk) to keep the firmware of your network devices 
 
 It reads what firmware each device is running over HTTP, compares it with the binaries you have built, and uploads the new one with a command you define. It works with any device that reports its firmware over HTTP and accepts an upload command. ESP8266, ESP32 and curl examples are included.
 
-![Main window](images/preview.PNG)
+![Main window](image/preview.PNG)
 
 Send messages to a device over HTTP or TCP and get the response in the log:
 
-![Command reply in the log](images/cmd.PNG)
+![Command reply in the log](image/cmd.PNG)
 
 ## Features
 
