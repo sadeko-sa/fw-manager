@@ -28,6 +28,14 @@ Send messages to a device over HTTP or TCP and get the response in the log:
 - tkinter
 - For OTA uploads with the example commands: `espota.py` from the ESP8266 / ESP32 Arduino cores, or `curl`.
 
+## Platform support
+
+| Platform | Status |
+| --- | --- |
+| PC | OK |
+| Linux | Should be OK, not tested |
+| Android | Limited: mDNS (`.local` host names) may not work if the OS does not support it, so use IP addresses; the UI is too big for the screen |
+
 ## Run
 
 ```
@@ -60,7 +68,7 @@ Each device needs an HTTP endpoint (default path `/version`, set per device) tha
 
 `md5` and `chip` are optional. On ESP8266 / ESP32 the md5 comes from `ESP.getSketchMD5()`.
 
-## Upload commands and variables
+## Variables
 
 `fw_manager.properties` holds your variables and upload commands:
 
